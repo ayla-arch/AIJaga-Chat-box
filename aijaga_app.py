@@ -1705,15 +1705,12 @@ h1, h2, h3 {{ font-family: 'Silkscreen', monospace !important; color: {C['ink']}
 .dots span:nth-child(2) {{ animation-delay: .2s; }} .dots span:nth-child(3) {{ animation-delay: .4s; }}
 @keyframes blink {{ 0%, 80%, 100% {{ opacity: .2; }} 40% {{ opacity: 1; }} }}
 
-/* Greeting: mascot + speech bubble */
-.greet {{ display: flex; align-items: center; gap: 30px; margin: 6px 0 22px 6px; flex-wrap: wrap; }}
+/* Greeting: mascot + big pixel title (no bubble) */
+.greet {{ display: flex; align-items: center; gap: 26px; margin: 4px 0 20px 6px; flex-wrap: wrap; }}
 .greet svg {{ flex: none; animation: bob 1.6s steps(1) infinite; }}
-.bubble-hello {{ position: relative; flex: 1; min-width: 240px; max-width: 560px; background: {C['card']};
-                 border: 4px solid {C['ink']}; box-shadow: 8px 8px 0 {C['ink']}; padding: 14px 20px; }}
-.bubble-hello::before {{ content: ""; position: absolute; left: -22px; top: 18px; border: 11px solid transparent;
-                         border-right-color: {C['ink']}; border-top-color: {C['ink']}; }}
-.bubble-hello .hello-title {{ margin: 4px 0 4px; font-size: 21px; font-weight: 800; color: {C['ink']}; }}
-.bubble-hello .hello-sub {{ margin: 0 0 8px; font-size: calc(15px * {fs}); color: {C['ink']}; }}
+.greet-text h1 {{ margin: 0 0 6px; font-size: clamp(26px, 3.4vw, 40px) !important; letter-spacing: 4px;
+                  color: {C['teal']} !important; line-height: 1.2; }}
+.greet-text p {{ margin: 0; font-size: calc(19px * {fs}) !important; font-weight: 800; color: {C['muted']}; }}
 
 /* Chat panel */
 .st-key-chat_panel {{ background: {C['card']}; border: 4px solid {C['ink']}; box-shadow: 8px 8px 0 {C['ink']};
@@ -1748,7 +1745,7 @@ h1, h2, h3 {{ font-family: 'Silkscreen', monospace !important; color: {C['ink']}
 [data-testid="stPopoverBody"] [data-testid="stImage"] img {{ border: 3px solid {C['ink']}; max-height: 180px; object-fit: contain; }}
 .pop-title {{ font-family: 'Silkscreen', monospace; font-size: 13px; letter-spacing: 2px; color: {C['ink']};
               border-bottom: 2px solid {C['ink']}; padding-bottom: 4px; margin-top: 4px; }}
-.st-key-voice_row {{ padding: 12px 0 14px; margin: 0; }}
+.st-key-voice_row {{ padding: 10px 0 4px; margin: 0; }}
 .st-key-voice_row [data-testid="stHorizontalBlock"] {{ align-items: center; }}
 .st-key-voice_row [data-testid="stCheckbox"] {{ display: flex; justify-content: flex-end; }}
 .st-key-voice_row [data-testid="stCheckbox"] label {{ padding: 4px 10px; border: 2px solid {C['ink']}; background: {C['chat_bg']}; }}
@@ -1786,6 +1783,7 @@ h1, h2, h3 {{ font-family: 'Silkscreen', monospace !important; color: {C['ink']}
 [class*="st-key-quick_"] button {{ box-shadow: 3px 3px 0 {C['ink']}; }}
 
 /* Other tools: light, see-through buttons that don't compete with the chat */
+.st-key-tools_col {{ gap: 10px; }}
 .tools-label {{ text-align: center; font-family: 'Silkscreen', monospace; font-size: 11px; letter-spacing: 3px;
                 color: {C['muted']}; margin: 22px 0 4px; }}
 [class*="st-key-tool_"] button {{ background: {C['glass']} !important; border: 3px solid {C['glass_line']} !important;
@@ -2413,15 +2411,12 @@ def chat_box():
                     "<span class='pixel sub' style='font-size:12px'>"
                     f"<span style='display:inline-block;width:10px;height:10px;background:{C['online']};margin-right:8px'></span>"
                     "DR. AZMI IS ONLINE</span></div>", unsafe_allow_html=True)
-        with st.container(key="voice_row"):
-            note, voice_col = st.columns([3, 1], vertical_alignment="center")
-            with note:
+        if S.chat_error or S.chat_note:
+            with st.container(key="voice_row"):
                 if S.chat_error:
                     notice(S.chat_error, "bad")
-                elif S.chat_note:
+                else:
                     st.caption(S.chat_note)
-            voice_col.toggle("🔊 VOICE", value=S.read_aloud, key="voice_toggle", on_change=toggle_voice,
-                             help="Turn on to hear Dr. Azmi read his replies aloud. Turn off to stop.")
 
         # Message history (scrolls when it gets long)
         with st.container(height=470, key="chat_log"):
@@ -2552,7 +2547,8 @@ def accessibility_panel():
         current = min(TEXT_SIZES, key=lambda name: abs(TEXT_SIZES[name] - S.font_scale))
         st.select_slider("Text size", options=list(TEXT_SIZES), value=current, key="text_size_box",
                          on_change=lambda: S.update(font_scale=TEXT_SIZES[S.text_size_box]))
-        st.caption("Dr. Azmi's voice is switched on/off with the 🔊 toggle inside the chat box.")
+        st.toggle("🔊 Dr. Azmi's voice", value=S.read_aloud, key="voice_toggle", on_change=toggle_voice,
+                  help="Turn on to hear Dr. Azmi read his replies aloud (male voice). Turn off to stop.")
         st.caption("Press Enter to send. Use Tab to move between controls.")
 
 
@@ -2778,25 +2774,17 @@ def hospitals_page():
 # 15. Pages
 # ---------------------------------------------------------------------------
 def home_page():
-    """Layout from the sketch: greeting + big chat + tools on the left; to-do, AI coach and settings on the right."""
+    """Sketch layout: greeting + big chat on the left; to-do, AI coach, settings and other tools on the right."""
     top_bar(show_level=False, show_todo=False)
     st.html(AUTOSCROLL_JS, unsafe_allow_javascript=True)
-    left, right = st.columns([2.2, 1], gap="large")
+    left, right = st.columns([2.6, 1], gap="large")
 
     with left:
-        st.markdown(f"<div class='greet'>{mascot(76)}"
-                    "<div class='bubble-hello'><div class='pixel sub' style='font-size:12px'>DR. AZMI</div>"
-                    "<p class='hello-title'>Hi, I am Dr. Azmi!</p>"
-                    "<p class='hello-sub'>Ask me any health question below — type, add a photo or send a voice note.</p>"
-                    "<div class='dots' aria-hidden='true'><span></span><span></span><span></span></div></div></div>",
+        st.markdown(f"<div class='greet'>{mascot(70)}<div class='greet-text'>"
+                    "<h1>HI, I'M DR. AZMI</h1><p>Ask me about your health — I'm here to help.</p></div></div>",
                     unsafe_allow_html=True)
         with st.container(key="chat_zone_open"):
             chat_box()
-        st.markdown("<div class='tools-label'>OTHER TOOLS</div>", unsafe_allow_html=True)
-        a, b, c = st.columns(3)
-        a.button("▶  VIDEO", key="tool_video", on_click=go, args=("video_fields",), use_container_width=True)
-        b.button("( ? )  QUIZ", key="tool_quiz", on_click=go, args=("quiz_fields",), use_container_width=True)
-        c.button("✚  NEARBY HOSPITALS", key="tool_hosp", on_click=go, args=("hospitals",), use_container_width=True)
 
     with right:
         st.html(TODO_LINK_HTML, unsafe_allow_javascript=True)
@@ -2805,6 +2793,11 @@ def home_page():
             personalise_panel()
             accessibility_panel()
             model_check_panel()
+        st.markdown("<div class='tools-label'>OTHER TOOLS</div>", unsafe_allow_html=True)
+        with st.container(key="tools_col"):
+            st.button("▶  VIDEO", key="tool_video", on_click=go, args=("video_fields",), use_container_width=True)
+            st.button("( ? )  QUIZ", key="tool_quiz", on_click=go, args=("quiz_fields",), use_container_width=True)
+            st.button("✚  NEARBY HOSPITAL", key="tool_hosp", on_click=go, args=("hospitals",), use_container_width=True)
     tv_footer()
 
 
