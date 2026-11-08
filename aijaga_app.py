@@ -1454,6 +1454,13 @@ def set_theme(name):
     S.theme = name
 
 
+def sync_theme_js():
+    """Tell the to-do pop-up which theme the main page uses (it switches live)."""
+    if S.get("theme_synced") != S.theme:
+        S.theme_synced = S.theme
+        run_js(f"try{{localStorage.setItem('aijaga:theme', '{S.theme}');}}catch(e){{}}")
+
+
 def run_js(code):
     S.js_queue.append(code)
 
@@ -1708,8 +1715,21 @@ body:has([data-testid="stPopoverBody"]) .st-key-chat_zone_closed::after {{ opaci
 .stApp [data-testid="stCheckbox"] label:has(input[role="switch"]:checked) > div:not([data-testid]) {{ background: {C['teal']} !important; }}
 .stApp [data-testid="stCheckbox"] label:has(input[role="switch"]) > div:not([data-testid]) > div {{
   background: {C['card']} !important; border: 2px solid {C['ink']}; }}
-.quick-label {{ margin: 8px 0 2px; font-family: 'Silkscreen', monospace; font-size: 11px; letter-spacing: 2px; color: {C['muted']}; }}
-[class*="st-key-quick_"] button {{ min-height: 38px; font-size: 14px; box-shadow: 3px 3px 0 {C['ink']}; }}
+.st-key-coach_box {{ background: {C['card']}; border: 3px solid {C['ink']}; box-shadow: 4px 4px 0 {C['coral']};
+                     padding: 10px 12px 12px; gap: 6px; margin: 4px 0 22px; }}
+.coach-title {{ font-family: 'Silkscreen', monospace; font-size: 14px; letter-spacing: 2px; color: {C['ink']}; }}
+.st-key-coach_box .coach-what {{ margin: 0; font-size: calc(13px * {fs}); line-height: 1.35; color: {C['ink']}; }}
+.coach-now {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 2px 0 8px; line-height: 1.6; }}
+.coach-label {{ font-family: 'Silkscreen', monospace; font-size: 10px; letter-spacing: 2px; color: {C['muted']}; }}
+.coach-tag {{ font-size: 10px !important; padding: 2px 6px !important; border-width: 2px !important; }}
+.st-key-coach_box .stButton button {{ min-height: 30px !important; padding: 2px 8px !important;
+  box-shadow: 2px 2px 0 {C['ink']} !important; border-width: 2px !important; }}
+.st-key-coach_box .stButton button p {{ font-size: 13px !important; }}
+.st-key-coach_box [data-testid="stCheckbox"] label p {{ font-size: 12px !important; }}
+.st-key-quickrow {{ border-top: 2px dashed {C['ink']}; padding-top: 12px; margin: 4px 0 12px; gap: 10px; }}
+.st-key-quickrow [class*="st-key-quick_"] button {{ min-height: 48px; font-size: 15px; padding: 6px 12px; }}
+.quick-label {{ margin: 0 0 2px; font-family: 'Silkscreen', monospace; font-size: 11px; letter-spacing: 2px; color: {C['muted']}; }}
+[class*="st-key-quick_"] button {{ box-shadow: 3px 3px 0 {C['ink']}; }}
 
 /* Other tools: light, see-through buttons that don't compete with the chat */
 .tools-label {{ text-align: center; font-family: 'Silkscreen', monospace; font-size: 11px; letter-spacing: 3px;
@@ -1980,6 +2000,81 @@ def todo_sync_js(tasks):
 """.replace("__TASKS__", json_for_script(tasks))
 
 
+# "I want to learn / know ...", "teach me ...", "saya nak belajar ..." -> a to-do topic
+LEARN_PATTERNS = [
+    re.compile(r"\b(?:i\s+(?:really\s+)?(?:want|wanna|would\s+like|'d\s+like|need)\s+to\s+(?:learn|know|understand|study)"
+               r"|i\s+wanna\s+(?:learn|know)|(?:can\s+you\s+|please\s+)?teach\s+me|help\s+me\s+(?:learn|understand))\b(.*)", re.I),
+    re.compile(r"\b(?:saya\s+(?:nak|mahu|ingin|hendak)\s+(?:belajar|tahu|faham)|ajar(?:kan)?\s+saya)\b(.*)", re.I),
+]
+LEARN_LEAD = re.compile(r"^\s*(?:more|all|about|on|regarding|tentang|mengenai|pasal|how\s+to|how|what|why|when|"
+                        r"the|a|an|to|i|is|are|do)\b\s*", re.I)
+GENERIC_STEMS = {_stem(w) for w in (
+    "want wanna know learn teach understand study more like need help please tell explain saya nak belajar tahu "
+    "tentang ajar health healthy photo look share general information see diagnose thing things something "
+    "question questions quiz system systems sign signs symptom symptoms prevent treat happen happens cause").split()}
+
+
+def todo_stems(text):
+    """Key words of a topic or question, used to link questions to to-do topics."""
+    words = set()
+    for w in re.split(r"[^a-z]+", (text or "").lower()):
+        if not w:
+            continue
+        words.update(_tokens(w))
+        if w in ALIAS:
+            words.update(_tokens(ALIAS[w]))
+    return sorted(words - GENERIC_STEMS)
+
+
+def learning_topic(text):
+    """The topic in 'I want to learn about dengue' -> 'dengue' (or None)."""
+    for pattern in LEARN_PATTERNS:
+        match = pattern.search(text or "")
+        if not match:
+            continue
+        topic = re.split(r"[.?!\n]", match.group(1))[0]
+        for _ in range(5):
+            topic = LEARN_LEAD.sub("", topic)
+        topic = re.sub(r"\s+(please|pls|plz|lah|ya|thanks?|thank you)\s*$", "", topic.strip(), flags=re.I).strip(" ,;:-")
+        if todo_stems(topic) and 2 <= len(topic) <= 80:
+            return topic[:60]
+        return None
+    return None
+
+
+def todo_event_js(question, learn=None):
+    """Update the to-do list saved in this browser: add a 'Learn about ...' topic, and link this
+    question to every matching topic. The to-do pop-up refreshes itself as soon as this runs."""
+    event = {"question": (question or "")[:140], "stems": todo_stems(question),
+             "learn": {"topic": learn, "stems": todo_stems(learn)} if learn else None}
+    return """
+(() => {
+  const key = "aijaga:learning-todos:v1";
+  const ev = __EVENT__;
+  let todos = [];
+  try { todos = JSON.parse(localStorage.getItem(key) || "[]"); if (!Array.isArray(todos)) todos = []; } catch (e) { todos = []; }
+  const now = new Date().toISOString();
+  todos.forEach((t) => {
+    if (!Array.isArray(t.stems) || !t.stems.length || !ev.question) return;
+    if (!t.stems.some((s) => ev.stems.includes(s))) return;
+    t.questions = Array.isArray(t.questions) ? t.questions : [];
+    if (!t.questions.includes(ev.question)) t.questions.push(ev.question);
+    t.questions = t.questions.slice(-5);
+    t.updatedAt = now;
+  });
+  if (ev.learn) {
+    const text = "Learn about " + ev.learn.topic;
+    if (!todos.some((t) => String(t.text).trim().toLowerCase() === text.toLowerCase())) {
+      todos.push({ id: `learn-${Date.now()}-${Math.random().toString(36).slice(2)}`, text, done: false,
+                   createdAt: now, updatedAt: now, source: "You asked", topic: ev.learn.topic,
+                   stems: ev.learn.stems, questions: [] });
+    }
+  }
+  try { localStorage.setItem(key, JSON.stringify(todos)); } catch (e) { console.error(e); }
+})();
+""".replace("__EVENT__", json_for_script(event))
+
+
 def themed(snippet):
     """Fill __INK__ / __CARD__ ... colour tokens in plain HTML/JS snippets."""
     for name, value in C.items():
@@ -2113,8 +2208,8 @@ def next_question():
     S.q_i += 1
     if S.q_i >= len(S.q_items):
         S.page = "quiz_result"
-        # Confetti only for AI quizzes with at least 2 correct answers (2/5 ... 5/5)
-        S.celebrate = S.q_source == "ai" and S.q_score >= 2
+        # Confetti when at least 2 answers are correct (2/5 ... 5/5, or 2/3, 3/3)
+        S.celebrate = S.q_score >= 2
 
 
 def open_video(title):
@@ -2131,6 +2226,40 @@ def ask_about(text):
 # ---------------------------------------------------------------------------
 # 12. Chat
 # ---------------------------------------------------------------------------
+AUTOSCROLL_JS = """
+<script>
+(() => {
+  const scroller = () => {
+    const box = document.querySelector(".st-key-chat_log");
+    if (!box) return null;
+    // only the chat box itself (never the whole page)
+    for (let el = box; el && !el.classList.contains("st-key-chat_panel") && el !== document.body; el = el.parentElement) {
+      const oy = getComputedStyle(el).overflowY;
+      if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight) return el;
+    }
+    return [...box.querySelectorAll("*")].find((el) => {
+      const oy = getComputedStyle(el).overflowY;
+      return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight;
+    }) || null;
+  };
+  window.aijagaScrollChat = () => { const el = scroller(); if (el) el.scrollTop = el.scrollHeight; };
+  setTimeout(window.aijagaScrollChat, 250);
+  if (window.__aijagaChatObserver) return;
+  let timer = null;
+  window.__aijagaChatObserver = new MutationObserver((mutations) => {
+    const box = document.querySelector(".st-key-chat_log");
+    if (box && mutations.some((m) => box.contains(m.target))) {
+      clearTimeout(timer);
+      timer = setTimeout(window.aijagaScrollChat, 60);   // new message or streaming text -> scroll down
+    }
+  });
+  window.__aijagaChatObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+})();
+</script>
+"""
+SCROLL_NOW_JS = "setTimeout(() => window.aijagaScrollChat && window.aijagaScrollChat(), 300);"
+
+
 def bot_bubble_html(text, alert=False, typing=False):
     body = ("<div class='dots' aria-label='Dr. Azmi is typing'><span></span><span></span><span></span></div>"
             if typing else md_to_html(text))
@@ -2157,6 +2286,10 @@ def run_chat_turn(prompt, live, image=None):
     plan = build_agent_plan(S.profile, S.messages)
     hit = find_topic(prompt)
     emergency = bool(EMERGENCY.search(prompt))
+    learn = learning_topic(prompt)
+    run_js(todo_event_js(prompt, learn))  # to-do list: add "Learn about ..." / link this question
+    learn_note = f"📝 Added “{learn}” to your learning to-do list." if learn else None
+    run_js(SCROLL_NOW_JS)
 
     reply = ""
     with live.container():
@@ -2175,7 +2308,7 @@ def run_chat_turn(prompt, live, image=None):
                       "Open ⚙ AI connection below to check your keys.")
         library, chips = library_reply(prompt, hit, emergency)
         reply += "\n\nMeanwhile, from the AiJaga library:\n" + library
-        S.chat_note = "Check your API keys in .streamlit/secrets.toml, or open ⚙ AI connection below."
+        S.chat_note = learn_note or "Check your API keys in .streamlit/secrets.toml, or open ⚙ AI connection below."
 
     S.messages.append({"role": "assistant", "content": reply, "alert": emergency, "chips": chips,
                        "quiz": [hit["fi"], hit["qi"]] if hit else None})
@@ -2184,13 +2317,13 @@ def run_chat_turn(prompt, live, image=None):
     if failed:
         return
 
-    S.chat_note = None
+    S.chat_note = learn_note
     try:  # learning to-do suggestions
         with st.spinner("Updating your learning to-do list..."):
             tasks = generate_learning_tasks(S.profile, S.messages, prompt, plan["topic"])
         if tasks:
             run_js(todo_sync_js(tasks))
-            S.chat_note = f"📝 Added {len(tasks)} task(s) to your learning to-do list."
+            S.chat_note = (learn_note + " " if learn_note else "📝 ") + f"Dr. Azmi added {len(tasks)} study task(s)."
     except RuntimeError as error:
         S.chat_error = str(error)
 
@@ -2209,13 +2342,13 @@ def chat_box():
                     f"<span style='display:inline-block;width:10px;height:10px;background:{C['online']};margin-right:8px'></span>"
                     "DR. AZMI IS ONLINE</span></div>", unsafe_allow_html=True)
         with st.container(key="voice_row"):
-            note, voice_col = st.columns([3, 1.3], vertical_alignment="center")
+            note, voice_col = st.columns([3, 1], vertical_alignment="center")
             with note:
                 if S.chat_error:
                     notice(S.chat_error, "bad")
                 elif S.chat_note:
                     st.caption(S.chat_note)
-            voice_col.toggle("🔊 DR. AZMI'S VOICE", value=S.read_aloud, key="voice_toggle", on_change=toggle_voice,
+            voice_col.toggle("🔊 VOICE", value=S.read_aloud, key="voice_toggle", on_change=toggle_voice,
                              help="Turn on to hear Dr. Azmi read his replies aloud. Turn off to stop.")
 
         # Message history (scrolls when it gets long)
@@ -2238,12 +2371,14 @@ def chat_box():
                     render_user(msg)
             live = st.empty()
 
-        # Quick questions
-        st.markdown("<div class='quick-label'>QUICK QUESTIONS</div>", unsafe_allow_html=True)
+        # Quick questions (their own roomy 2 x 2 area, above the typing box)
         prompt, image = None, None
-        for col, (k, q) in zip(st.columns(len(QUICK_QUESTIONS)), enumerate(QUICK_QUESTIONS)):
-            if col.button(q, key=f"quick_{k}", use_container_width=True):
-                prompt = q
+        with st.container(key="quickrow"):
+            st.markdown("<div class='quick-label'>💡 QUICK QUESTIONS — TAP ONE TO ASK</div>", unsafe_allow_html=True)
+            cols = st.columns(2) + st.columns(2)
+            for col, (k, q) in zip(cols, enumerate(QUICK_QUESTIONS)):
+                if col.button(q, key=f"quick_{k}", use_container_width=True):
+                    prompt = q
 
         # "+" (photo / voice note), typing box and SEND
         n = S.upload_nonce
@@ -2297,11 +2432,14 @@ def chat_box():
 # ---------------------------------------------------------------------------
 # 13. Settings: AI coach, personalisation, accessibility, model check
 # ---------------------------------------------------------------------------
-def coach_panel():
-    with st.expander("🧭 AI COACH"):
-        plan = build_agent_plan(S.profile, S.messages)
-        st.markdown(f"<div class='side-card'><span class='tag'>{esc(plan['topic'].upper())}</span>"
-                    f"<p>{esc(plan['summary'])}</p></div>", unsafe_allow_html=True)
+def coach_card():
+    """Small AI coach box: what it does + the next step it suggests."""
+    plan = build_agent_plan(S.profile, S.messages)
+    with st.container(key="coach_box"):
+        st.markdown(f"<div class='coach-title'>🧭 AI COACH</div>"
+                    f"<p class='coach-what'>Suggests your next step: a video, a quiz or a follow-up.</p>"
+                    f"<div class='coach-now'><span class='coach-label'>FOCUS</span>"
+                    f"<span class='tag coach-tag'>{esc(plan['topic'].upper())}</span></div>", unsafe_allow_html=True)
         for k, s in enumerate(plan["suggestions"]):
             if st.button(s["label"], key=f"coach_{k}", help=s["reason"], use_container_width=True):
                 if s["target"] == "quiz":
@@ -2312,8 +2450,9 @@ def coach_panel():
                 else:
                     S.chat_note = "✍️ Type your follow-up question in the chat box."
                 st.rerun()
-        st.toggle("Auto-start a quiz when I ask to practise", key="auto_start_box", value=S.auto_start_learning,
-                  on_change=lambda: S.update(auto_start_learning=S.auto_start_box))
+        st.toggle("Auto-quiz on “quiz me”", key="auto_start_box", value=S.auto_start_learning,
+                  on_change=lambda: S.update(auto_start_learning=S.auto_start_box),
+                  help="When you type 'quiz me' or 'test me', Dr. Azmi starts a quiz on that topic straight away.")
 
 
 def personalise_panel():
@@ -2565,9 +2704,13 @@ def hospitals_page():
 # ---------------------------------------------------------------------------
 def home_page():
     top_bar()
-    st.markdown(f"<div class='hero'>{mascot(88)}<span class='tag'>DR. AZMI</span>"
-                f"<h1>HI, I'M DR. AZMI</h1><p>Ask me about your health — I'm here to help.</p></div>",
-                unsafe_allow_html=True)
+    _, hero, coach = st.columns([1, 1.7, 1], gap="medium")
+    hero.markdown(f"<div class='hero'>{mascot(88)}<span class='tag'>DR. AZMI</span>"
+                  f"<h1>HI, I'M DR. AZMI</h1><p>Ask me about your health — I'm here to help.</p></div>",
+                  unsafe_allow_html=True)
+    with coach:
+        coach_card()
+    st.html(AUTOSCROLL_JS, unsafe_allow_javascript=True)
     _, mid, _ = st.columns([0.06, 1, 0.06])
     with mid:
         chat_started = any(m["role"] == "user" for m in S.messages)
@@ -2582,14 +2725,12 @@ def home_page():
 
         st.markdown("<div class='tools-label'>SETTINGS</div>", unsafe_allow_html=True)
         with st.container(key="settings_row"):
-            cols = st.columns(4)
+            cols = st.columns(3)
             with cols[0]:
-                coach_panel()
-            with cols[1]:
                 personalise_panel()
-            with cols[2]:
+            with cols[1]:
                 accessibility_panel()
-            with cols[3]:
+            with cols[2]:
                 model_check_panel()
     tv_footer()
 
@@ -2785,7 +2926,7 @@ def quiz_result_page():
                      on_click=start_quiz, args=(S.q_field, S.q_topic))
         b.button("OTHER QUIZZES", use_container_width=True, on_click=go, args=("quiz_fields",))
         c.button("ASK DR. AZMI", use_container_width=True, on_click=go, args=("home",))
-    if S.celebrate:  # AI quiz with 2+ correct answers
+    if S.celebrate:  # 2 or more correct answers
         S.celebrate = False
         run_js(CONFETTI_JS)
     tv_footer()
@@ -2887,108 +3028,213 @@ def video_watch_page():
 
 # ---- LEARNING TO-DO (opens in a pop-up: ?view=todo) -----------------------
 TODO_HTML = """
-<div id="todo-root" style="max-width:520px;margin:0 auto;font-family:'Nunito',sans-serif;color:__INK__;">
-  <div style="display:flex;gap:8px;margin:16px 0;">
-    <input id="todo-input" aria-label="New learning task" maxlength="120" placeholder="Add your own learning task…"
-      style="flex:1;min-width:0;padding:10px;border:3px solid __INK__;background:__CARD__;color:__INK__;font-size:16px;box-sizing:border-box;">
-    <button id="todo-add" type="button"
-      style="padding:10px 16px;border:3px solid __INK__;background:__TEAL__;color:__BTN_TEXT__;font-weight:800;cursor:pointer;box-shadow:3px 3px 0 __INK__;">
-      ADD
-    </button>
+<div id="todo-root" class="todo-root">
+  <div class="todo-add-row">
+    <input id="todo-input" aria-label="New learning task" maxlength="120" placeholder="Add your own learning task…">
+    <button id="todo-add" type="button">ADD</button>
   </div>
-  <p id="todo-status" role="status" aria-live="polite" style="color:__BAD_TEXT__;"></p>
+  <p id="todo-status" class="todo-status" role="status" aria-live="polite"></p>
+  <div id="todo-summary" class="todo-summary"></div>
   <div id="todo-list"></div>
-  <p style="font-size:12px;color:__MUTED__;margin-top:18px;">
-    Suggestions are for health learning only, not medical care or treatment advice.
-  </p>
+  <p class="todo-fine">Updates by itself while you chat with Dr. Azmi. Suggestions are for health learning only,
+    not medical care or treatment advice.</p>
 </div>
 <script>
 (() => {
   const storageKey = "aijaga:learning-todos:v1";
   const list = document.getElementById("todo-list");
   const status = document.getElementById("todo-status");
+  const summary = document.getElementById("todo-summary");
   const input = document.getElementById("todo-input");
   const addButton = document.getElementById("todo-add");
   if (!list || list.dataset.ready) return;
   list.dataset.ready = "1";
+
+  // ---- theme: follow the main AiJaga page (BRIGHT / DARK), live ----
+  const applyTheme = () => {
+    let theme = "bright";
+    try { theme = localStorage.getItem("aijaga:theme") || "bright"; } catch (e) {}
+    document.documentElement.setAttribute("data-aijaga-theme", theme === "dark" ? "dark" : "bright");
+  };
+  applyTheme();
+
   let todos = [];
+  let lastSaved = "";
   const save = () => {
-    try { localStorage.setItem(storageKey, JSON.stringify(todos)); status.textContent = ""; return true; }
+    try { lastSaved = JSON.stringify(todos); localStorage.setItem(storageKey, lastSaved); status.textContent = ""; return true; }
     catch (error) { status.textContent = "Could not save changes in this browser. Check storage permissions or space."; return false; }
   };
   const load = () => {
     try {
-      const stored = localStorage.getItem(storageKey);
-      const parsed = stored ? JSON.parse(stored) : [];
+      const stored = localStorage.getItem(storageKey) || "[]";
+      if (stored === lastSaved) return false;          // nothing new
+      const parsed = JSON.parse(stored);
       if (!Array.isArray(parsed)) throw new Error("Saved to-do list is not a list.");
       todos = parsed.filter((t) => t && typeof t.id === "string" && typeof t.text === "string");
+      lastSaved = stored;
       return true;
     } catch (error) { status.textContent = "Could not read saved tasks in this browser."; return false; }
   };
+  const ago = (iso) => {
+    if (!iso) return "";
+    const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.round(s / 60) + " min ago";
+    if (s < 86400) return Math.round(s / 3600) + " h ago";
+    return Math.round(s / 86400) + " d ago";
+  };
   const render = () => {
     list.replaceChildren();
+    const done = todos.filter((t) => t.done).length;
+    summary.textContent = todos.length ? `${done} of ${todos.length} done` : "";
     if (!todos.length) {
       const empty = document.createElement("p");
-      empty.textContent = "No tasks yet. Ask Dr. Azmi to explain a health topic, or add your own task.";
+      empty.className = "todo-empty";
+      empty.textContent = "No tasks yet. Tell Dr. Azmi “I want to learn about …” or add your own task.";
       list.append(empty);
       return;
     }
-    todos.forEach((todo) => {
+    // newest activity first, finished tasks last
+    const sorted = [...todos].sort((a, b) => (a.done - b.done) ||
+      String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")));
+    sorted.forEach((todo) => {
       const row = document.createElement("div");
-      row.style.cssText = "display:flex;align-items:center;gap:10px;padding:12px;margin:10px 0;border:3px solid __INK__;background:__CARD__;box-shadow:4px 4px 0 __INK__;";
+      row.className = "todo-row" + (todo.done ? " done" : "");
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.checked = Boolean(todo.done);
-      checkbox.style.cssText = "width:20px;height:20px;accent-color:__TEAL__;";
       checkbox.setAttribute("aria-label", `Mark ${todo.text} complete`);
-      checkbox.addEventListener("change", () => { todo.done = checkbox.checked; save(); render(); });
-      const text = document.createElement("span");
+      checkbox.addEventListener("change", () => { todo.done = checkbox.checked; todo.updatedAt = new Date().toISOString(); save(); render(); });
+      const body = document.createElement("div");
+      body.className = "todo-body";
+      const text = document.createElement("div");
+      text.className = "todo-text";
       text.textContent = todo.text;
-      text.style.cssText = "flex:1;overflow-wrap:anywhere;font-weight:700;color:__INK__;";
-      if (todo.done) { text.style.textDecoration = "line-through"; text.style.opacity = ".6"; }
-      const source = document.createElement("small");
-      source.textContent = todo.source || "";
-      source.style.cssText = "color:__MUTED__;";
+      const meta = document.createElement("div");
+      meta.className = "todo-meta";
+      const qs = Array.isArray(todo.questions) ? todo.questions : [];
+      const pill = document.createElement("span");
+      pill.className = "todo-pill" + (todo.done ? " ok" : qs.length ? " live" : "");
+      pill.textContent = todo.done ? "DONE" : Array.isArray(todo.stems) ? (qs.length ? `IN PROGRESS · ${qs.length} question${qs.length > 1 ? "s" : ""}` : "NEW TOPIC") : "TASK";
+      const when = document.createElement("span");
+      when.textContent = `${todo.source || ""}${todo.updatedAt ? " · updated " + ago(todo.updatedAt) : ""}`;
+      meta.append(pill, when);
+      body.append(text, meta);
+      if (qs.length) {
+        const ul = document.createElement("ul");
+        ul.className = "todo-qs";
+        qs.slice(-3).forEach((q) => { const li = document.createElement("li"); li.textContent = q; ul.append(li); });
+        body.append(ul);
+      }
       const remove = document.createElement("button");
       remove.type = "button";
+      remove.className = "todo-remove";
       remove.textContent = "Remove";
-      remove.style.cssText = "padding:6px 9px;border:2px solid __INK__;background:__CHIP__;color:__INK__;font-weight:700;cursor:pointer;";
       remove.addEventListener("click", () => { todos = todos.filter((item) => item.id !== todo.id); save(); render(); });
-      row.append(checkbox, text, source, remove);
+      row.append(checkbox, body, remove);
       list.append(row);
     });
   };
   const addTask = () => {
     const text = input.value.trim();
     if (!text) return;
+    const now = new Date().toISOString();
     todos.push({ id: `user-${Date.now()}-${Math.random().toString(36).slice(2)}`, text: text.slice(0, 120),
-                 done: false, createdAt: new Date().toISOString(), source: "You" });
+                 done: false, createdAt: now, updatedAt: now, source: "You" });
     if (save()) { input.value = ""; render(); }
   };
   addButton.addEventListener("click", addTask);
   input.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); addTask(); } });
-  window.addEventListener("storage", (event) => { if (event.key === storageKey && load()) render(); });
-  window.addEventListener("focus", () => { if (load()) render(); });
-  if (load()) render();
+
+  // live updates from the main page: storage events + a light check every 1.5 s (no refresh needed)
+  window.addEventListener("storage", (event) => {
+    if (event.key === "aijaga:theme") applyTheme();
+    if (event.key === storageKey && load()) render();
+  });
+  setInterval(() => { applyTheme(); if (load()) render(); }, 1500);
+  setInterval(render, 60000);   // keep "updated x min ago" fresh
+  load();
+  render();
 })();
 </script>
 """
 
 
+def todo_css():
+    """To-do pop-up colours as CSS variables, so BRIGHT / DARK can switch live with the main page."""
+    def variables(c):
+        return (f"--t-page:{c['page']};--t-screen:{c['screen']};--t-scan:{c['scan']};--t-frame:{c['frame']};"
+                f"--t-edge:{c['frame_edge']};--t-frame-text:{c['frame_text']};--t-ink:{c['ink']};--t-muted:{c['muted']};"
+                f"--t-card:{c['card']};--t-chip:{c['chip']};--t-teal:{c['teal']};--t-coral:{c['coral']};"
+                f"--t-btn-text:{c['btn_text']};--t-ok:{c['ok']};--t-ok-soft:{c['ok_soft']};--t-ok-text:{c['ok_text']};"
+                f"--t-bad-text:{c['bad_text']};--t-done-bg:{c['done_bg']};--t-done-ink:{c['done_ink']};")
+    return f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Silkscreen:wght@400;700&family=Nunito:wght@500;600;700;800&display=swap');
+:root, html[data-aijaga-theme="bright"] {{ {variables(THEMES['bright'])} }}
+html[data-aijaga-theme="dark"] {{ {variables(THEMES['dark'])} color-scheme: dark; }}
+#MainMenu, header[data-testid="stHeader"], footer {{ visibility: hidden; height: 0; }}
+[data-testid="InputInstructions"] {{ display: none !important; }}
+.stApp {{ background: var(--t-page) !important; }}
+html, body, .stApp, p, label, li, input, .stMarkdown {{ font-family: 'Nunito', sans-serif; color: var(--t-ink); }}
+.block-container {{ max-width: 640px; margin: 24px auto 0; padding: 22px 24px 26px !important;
+  background-color: var(--t-screen); background-image: repeating-linear-gradient(0deg, var(--t-scan) 0 2px, transparent 2px 5px);
+  border: 8px solid var(--t-edge); border-radius: 24px; box-shadow: 0 0 0 18px var(--t-frame), 0 18px 0 18px var(--t-frame); }}
+.pixel, h1 {{ font-family: 'Silkscreen', monospace !important; color: var(--t-ink) !important; letter-spacing: 2px; }}
+.logo {{ display: flex; align-items: center; justify-content: center; gap: 10px; }}
+.page-title {{ text-align: center; font-size: 22px; margin: 12px 0 2px; }}
+.page-sub {{ text-align: center; font-family: 'Silkscreen', monospace; font-size: 12px; letter-spacing: 3px; color: var(--t-muted); margin: 0 0 8px; }}
+.todo-note {{ text-align: center; font-size: 14px; color: var(--t-muted); margin: 0; }}
+.todo-root {{ font-family: 'Nunito', sans-serif; color: var(--t-ink); }}
+.todo-add-row {{ display: flex; gap: 8px; margin: 14px 0 6px; }}
+.todo-add-row input {{ flex: 1; min-width: 0; padding: 10px; border: 3px solid var(--t-ink); background: var(--t-card);
+  color: var(--t-ink); font-size: 16px; box-sizing: border-box; }}
+.todo-add-row button {{ padding: 10px 16px; border: 3px solid var(--t-ink); background: var(--t-teal); color: var(--t-btn-text);
+  font-family: 'Silkscreen', monospace; cursor: pointer; box-shadow: 3px 3px 0 var(--t-ink); }}
+.todo-status {{ color: var(--t-bad-text); margin: 0; }}
+.todo-summary {{ font-family: 'Silkscreen', monospace; font-size: 12px; letter-spacing: 2px; color: var(--t-muted); margin: 4px 0; }}
+.todo-row {{ display: flex; align-items: flex-start; gap: 10px; padding: 12px; margin: 10px 0; border: 3px solid var(--t-ink);
+  background: var(--t-card); box-shadow: 4px 4px 0 var(--t-ink); }}
+.todo-row.done {{ background: var(--t-done-bg); }}
+.todo-row input {{ width: 20px; height: 20px; margin-top: 3px; accent-color: var(--t-teal); flex: none; }}
+.todo-body {{ flex: 1; min-width: 0; }}
+.todo-text {{ font-weight: 800; color: var(--t-ink); overflow-wrap: anywhere; }}
+.todo-row.done .todo-text {{ text-decoration: line-through; color: var(--t-done-ink); }}
+.todo-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; font-size: 12px; color: var(--t-muted); }}
+.todo-pill {{ font-family: 'Silkscreen', monospace; font-size: 10px; letter-spacing: 1px; padding: 2px 6px;
+  border: 2px solid var(--t-ink); background: var(--t-chip); color: var(--t-ink); }}
+.todo-pill.live {{ background: var(--t-coral); color: #1C2B33; }}
+.todo-pill.ok {{ background: var(--t-ok-soft); color: var(--t-ok-text); border-color: var(--t-ok-text); }}
+.todo-qs {{ margin: 6px 0 0; padding-left: 18px; font-size: 13px; color: var(--t-ink); }}
+.todo-qs li {{ margin: 2px 0; color: var(--t-ink); }}
+.todo-remove {{ padding: 6px 9px; border: 2px solid var(--t-ink); background: var(--t-chip); color: var(--t-ink);
+  font-weight: 700; cursor: pointer; flex: none; }}
+.todo-empty {{ color: var(--t-muted); }}
+.todo-fine {{ font-size: 12px; color: var(--t-muted); margin-top: 18px; }}
+.tv-footer {{ display: flex; justify-content: space-between; align-items: center; margin: 30px -24px -26px; padding: 16px 24px;
+  background: var(--t-frame); }}
+.grille span {{ display: inline-block; width: 6px; height: 28px; margin-right: 6px; border-radius: 3px; background: var(--t-edge); }}
+.knob {{ display: inline-block; width: 30px; height: 30px; border-radius: 50%; background: var(--t-edge); margin-left: 10px; }}
+.led {{ display: inline-block; width: 11px; height: 11px; border-radius: 50%; background: var(--t-coral); margin-left: 10px; }}
+.tv-name {{ font-family: 'Silkscreen', monospace; color: var(--t-frame-text); letter-spacing: 4px; }}
+</style>
+"""
+
+
 def todo_page():
-    st.markdown(f"<div class='logo' style='justify-content:center'>{LOGO_SVG.format(w=46, h=40)}"
-                f"<span class='pixel' style='font-size:24px;letter-spacing:3px'>AIJAGA</span></div>",
+    st.markdown(todo_css(), unsafe_allow_html=True)
+    st.markdown(f"<div class='logo'>{LOGO_SVG.format(w=46, h=40)}"
+                f"<span class='pixel' style='font-size:24px'>AIJAGA</span></div>"
+                f"<h1 class='page-title'>📝 LEARNING TO-DO</h1><p class='page-sub'>YOUR NEXT LEARNING STEPS</p>"
+                f"<p class='todo-note'>Say “I want to learn about …” or “teach me …” to Dr. Azmi and the topic "
+                f"appears here. Questions you ask about it are added automatically. "
+                f"Bright/dark mode follows the main page. Saved only in this browser.</p>",
                 unsafe_allow_html=True)
-    page_heading("📝 LEARNING TO-DO", "YOUR NEXT LEARNING STEPS")
-    st.caption("Dr. Azmi adds tasks after explaining a topic. You can add, tick off or remove tasks. "
-               "Saved only in this browser on this device.")
-    st.html(themed(TODO_HTML), unsafe_allow_javascript=True)
-    b, d = st.columns(2)
-    b.button("BRIGHT", key="bright_todo", use_container_width=True,
-             type="primary" if S.theme == "bright" else "secondary", on_click=set_theme, args=("bright",))
-    d.button("DARK", key="dark_todo", use_container_width=True,
-             type="primary" if S.theme == "dark" else "secondary", on_click=set_theme, args=("dark",))
-    tv_footer()
+    st.html(TODO_HTML, unsafe_allow_javascript=True)
+    st.markdown("<div class='tv-footer'><div class='grille'><span></span><span></span><span></span><span></span></div>"
+                "<span class='tv-name'>AIJAGA TV</span>"
+                "<div><span class='knob'></span><span class='knob'></span><span class='led'></span></div></div>",
+                unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3006,9 +3252,10 @@ PAGES = {
     "hospitals": hospitals_page,
 }
 
-inject_css()
 if st.query_params.get("view") == "todo":
     todo_page()
 else:
+    inject_css()
+    sync_theme_js()
     PAGES.get(S.page, home_page)()
 flush_js()
