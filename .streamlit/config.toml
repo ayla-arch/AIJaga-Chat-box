@@ -1,0 +1,5 @@
+# Put this file in the .streamlit folder (next to secrets.toml).
+# It makes Streamlit's own widgets start in light mode, so BRIGHT mode is always readable.
+[theme]
+base = "light"
+primaryColor = "#2D6A5C"

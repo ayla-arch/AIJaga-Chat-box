@@ -12,21 +12,27 @@ Groq is tried first, Gemini is the backup (change PRIMARY_PROVIDER below).
 Photos and voice notes need the Gemini key.
 
 What's inside
-    HOME    Dr. Azmi chat (text, photo, voice), quick questions, AI coach, personalisation,
-            accessibility, nearby hospital finder, AI model check
-    QUIZ    library quizzes (field -> topic -> questions) + AI quizzes made from your chat
-    VIDEO   field -> video -> watch, playlist, "take the quiz" / "ask Dr. Azmi"
-    TO-DO   learning to-do list (opens in a pop-up window, saved in this browser)
+    HOME       Dr. Azmi chat: hover START to open it (text, photo analysis, voice notes, voice on/off)
+               + light tool buttons: VIDEO, QUIZ, NEARBY HOSPITALS + settings (coach, profile, accessibility)
+    QUIZ       library quizzes + AI quizzes (from your chat or any topic, 5 difficulty levels)
+    VIDEO      field -> video -> watch, playlist, "take the quiz" / "ask Dr. Azmi"
+    HOSPITALS  asks before using your location, or searches from an address you type
+    TO-DO      learning to-do list (opens in a pop-up window, saved in this browser)
+Tip: also copy config.toml into the .streamlit folder so Streamlit's own widgets start in light mode.
 Optional: put a sound file at assets/correct-answer.mp3 to play it on correct answers.
 """
 
+import base64
 import html
+import io
 import json
+import math
 import random
 import re
 import time
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 
 import streamlit as st
 
@@ -37,7 +43,6 @@ except ImportError:  # the app still runs on Groq if google-genai is missing
     genai = None
     types = None
 
-st.set_page_config(page_title="AiJaga", page_icon="🩺", layout="wide", initial_sidebar_state="collapsed")
 
 DOCTOR = "Dr. Azmi"
 Q_PER = 3  # questions per library quiz (practice sets use their own limit)
@@ -52,14 +57,20 @@ THEMES = {
         "screen": "#E1EEEA", "scan": "rgba(255,255,255,0.5)", "ink": "#1C2B33", "sub": "#344A50",
         "card": "#FFFFFF", "chat_bg": "#F2F7F5", "teal": "#2D6A5C", "coral": "#E36F52",
         "chip": "#D3EAE2", "btn_text": "#FFFFFF", "online": "#2FAE5E",
-        "ok": "#2F9E6B", "bad": "#D64545", "done_bg": "#DCDEDD", "done_ink": "#6A7378", "done_line": "#9AA3A8",
+        "ok": "#2F9E6B", "bad": "#D64545", "done_bg": "#DCDEDD", "done_ink": "#5E676C", "done_line": "#9AA3A8",
+        "ok_soft": "#E2F4EA", "ok_text": "#17663F", "bad_soft": "#FBE7E5", "bad_text": "#A82A22",
+        "info_soft": "#FFF4DD", "glass": "rgba(255,255,255,0.35)", "glass_line": "rgba(28,43,51,0.35)",
+        "muted": "#4F6369",
     },
     "dark": {
         "page": "#111517", "frame": "#3B3229", "frame_edge": "#2A231C", "frame_text": "#C9A982",
         "screen": "#13221F", "scan": "rgba(0,0,0,0.28)", "ink": "#E4F1ED", "sub": "#A8C3BC",
         "card": "#1A2E2A", "chat_bg": "#152623", "teal": "#5CC0A6", "coral": "#F08A6E",
         "chip": "#1F3A34", "btn_text": "#0D1916", "online": "#4FD481",
-        "ok": "#2F9E6B", "bad": "#D64545", "done_bg": "#26323A", "done_ink": "#7D8B93", "done_line": "#4A5861",
+        "ok": "#2F9E6B", "bad": "#D64545", "done_bg": "#26323A", "done_ink": "#93A1A8", "done_line": "#4A5861",
+        "ok_soft": "#173A2A", "ok_text": "#7FE0AE", "bad_soft": "#3E1F21", "bad_text": "#FF9C8F",
+        "info_soft": "#33301F", "glass": "rgba(255,255,255,0.05)", "glass_line": "rgba(228,241,237,0.30)",
+        "muted": "#A8C3BC",
     },
 }
 
@@ -669,6 +680,8 @@ EMERGENCY_NOTE = "If this is an emergency, call 999 (or 112 from a mobile) now a
 MODELS = ["gemini-3.8-flash"]
 # Backup provider (free). Check console.groq.com for current model names.
 GROQ_MODEL = "openai/gpt-oss-120b"
+# Groq model that can look at photos (backup when Gemini can't analyse a picture).
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 # Which provider to try FIRST for every message: "groq" or "gemini".
 PRIMARY_PROVIDER = "groq"
 
@@ -895,11 +908,17 @@ def _groq_client():
     return Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 
-def _stream_groq(profile: dict, messages: list, max_history: int = 20):
+def _stream_groq(profile: dict, messages: list, max_history: int = 20, image=None):
     msgs = [{"role": "system", "content": build_system_prompt(profile)}]
-    for m in messages[-max_history:]:
-        msgs.append({"role": m["role"], "content": m["content"]})
-    stream = _groq_client().chat.completions.create(model=GROQ_MODEL, messages=msgs, temperature=0.6, stream=True)
+    recent = messages[-max_history:]
+    for index, m in enumerate(recent):
+        content = m["content"]
+        if image and index == len(recent) - 1 and m["role"] == "user":
+            data_url = f"data:{image[1]};base64," + base64.b64encode(image[0]).decode("ascii")
+            content = [{"type": "text", "text": m["content"]}, {"type": "image_url", "image_url": {"url": data_url}}]
+        msgs.append({"role": m["role"], "content": content})
+    stream = _groq_client().chat.completions.create(model=GROQ_VISION_MODEL if image else GROQ_MODEL,
+                                                    messages=msgs, temperature=0.6, stream=True)
     for chunk in stream:
         text = chunk.choices[0].delta.content
         if text:
@@ -984,13 +1003,25 @@ def _quiz_source_from_messages(messages: list, max_chars: int = 7000) -> str:
     return source[-max_chars:]
 
 
-def generate_quiz_from_chat(profile: dict, messages: list, topic: str, max_questions: int = 5) -> list:
+AI_LEVELS = ["Easy", "Intermediate", "Advance", "Professional", "Master"]
+DIFFICULTY_GUIDE = {
+    "Easy": "simple recall of key facts in everyday words; wrong options are clearly wrong",
+    "Intermediate": "understanding why things happen, with simple application",
+    "Advance": "applying the facts to short realistic school or home situations",
+    "Professional": "multi-step scenarios using correct health terms, like a first-aid or health course",
+    "Master": "challenging scenario reasoning with close, believable wrong options (still safe and educational)",
+}
+
+
+def generate_quiz_from_chat(profile: dict, messages: list, topic: str, max_questions: int = 5,
+                            difficulty: str = "Easy") -> list:
     source = _quiz_source_from_messages(messages)
     prompt = f"""
-Create 3 to {max_questions} multiple-choice quiz questions from {DOCTOR}'s latest reply below.
+Create exactly {max_questions} multiple-choice quiz questions from {DOCTOR}'s latest reply below.
 Topic label: {topic}
 Learner age group: {profile.get("age_group", "14-15")}
 Learner knowledge level: {profile.get("knowledge", "Just starting")}
+Difficulty: {difficulty} - {DIFFICULTY_GUIDE.get(difficulty, DIFFICULTY_GUIDE["Easy"])}
 
 Use only this reply as the source of facts. Test understanding of that explanation,
 not unrelated facts. Do not invent medical claims, diagnose, recommend treatment, or ask about
@@ -1007,6 +1038,42 @@ Latest reply:
         return validate_generated_quiz(_json_from_ai(prompt), max_questions=max_questions)
     except Exception as error:
         raise RuntimeError(f"{DOCTOR} couldn't create a quiz from this chat.") from error
+
+
+def generate_quiz_from_topic(profile: dict, topic: str, difficulty: str = "Easy", max_questions: int = 5) -> list:
+    """A fresh 5-question AI quiz about any health topic."""
+    prompt = f"""
+Create exactly {max_questions} multiple-choice health-education quiz questions about: {topic}
+Learner: Malaysian secondary school student, age group {profile.get("age_group", "14-15")},
+knowledge level {profile.get("knowledge", "Just starting")}.
+Difficulty: {difficulty} - {DIFFICULTY_GUIDE.get(difficulty, DIFFICULTY_GUIDE["Easy"])}
+Only use well-established, safe, general health facts. Do not diagnose, give medicine doses,
+or ask about private personal details. For emergencies, the correct action includes calling 999.
+If the topic is not a health topic, return {{"questions":[]}}.
+Return only JSON in this exact shape:
+{{"questions":[{{"question":"...","options":["...","...","...","..."],"answer":0,"explanation":"..."}}]}}
+The answer is a zero-based integer index into options. Vary which position holds the correct answer.
+""".strip()
+    try:
+        return validate_generated_quiz(_json_from_ai(prompt), max_questions=max_questions)
+    except Exception as error:
+        raise RuntimeError(f"{DOCTOR} couldn't create an AI quiz about {topic} right now.") from error
+
+
+def prepare_image(data: bytes, mime: str):
+    """Shrink big photos (and convert webp/heic) so the AI can read them."""
+    try:
+        from PIL import Image, ImageOps
+
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+        if max(image.size) > 1600 or len(data) > 3_000_000 or mime not in ("image/jpeg", "image/png"):
+            image.thumbnail((1600, 1600))
+            buffer = io.BytesIO()
+            image.convert("RGB").save(buffer, "JPEG", quality=85)
+            return buffer.getvalue(), "image/jpeg"
+    except Exception as error:
+        print("IMAGE PREP ERROR:", repr(error))
+    return data, mime
 
 
 def validate_learning_tasks(payload: dict, max_tasks: int = 3) -> list:
@@ -1083,7 +1150,7 @@ def transcribe_audio(audio_data: bytes, mime_type: str) -> str:
 def stream_reply(profile: dict, messages: list, max_history: int = 20, image=None):
     """Yield text chunks. Tries PRIMARY_PROVIDER first; if it fails before any text
     comes back, falls through to the other provider automatically.
-    Photos (image=(bytes, mime_type)) always go to Gemini."""
+    Photos (image=(bytes, mime_type)) go to Gemini first, then to Groq's vision model."""
     contents, config = [], None
     if types is not None:
         recent_messages = messages[-max_history:]
@@ -1097,8 +1164,8 @@ def stream_reply(profile: dict, messages: list, max_history: int = 20, image=Non
 
     gemini_attempts = [("gemini", model) for model in MODELS]
     groq_attempts = [("groq", GROQ_MODEL)]
-    if image:
-        attempts = gemini_attempts
+    if image:  # photos: Gemini first, then Groq's vision model
+        attempts = gemini_attempts + [("groq", GROQ_VISION_MODEL)]
     elif PRIMARY_PROVIDER == "groq":
         attempts = groq_attempts + gemini_attempts
     else:
@@ -1114,7 +1181,7 @@ def stream_reply(profile: dict, messages: list, max_history: int = 20, image=Non
                         raise RuntimeError("google-genai is not installed (pip install google-genai)")
                     source = _call_gemini(model, contents, config)
                 else:
-                    source = _stream_groq(profile, messages, max_history)
+                    source = _stream_groq(profile, messages, max_history, image=image)
                 for chunk in source:
                     got_text = True
                     yield chunk
@@ -1277,24 +1344,26 @@ MINI_DOCTOR_SVG = """
 </svg>
 """
 
-DOC_PAL = {"h": "#5b3a29", "s": "#f2b88f", "b": "#1b2a35", "e": "#1b2a35", "w": "#ffffff",
-           "g": "#2d6a5a", "r": "#e07050", "m": "#b8433f", "k": "#cfd9d6"}
 
 
-def pix(rows, pal, px):
-    w, h = len(rows[0]), len(rows)
-    rects = "".join(f'<rect x="{x}" y="{y}" width="1.02" height="1.02" fill="{pal[c]}"/>'
-                    for y, row in enumerate(rows) for x, c in enumerate(row) if c in pal)
-    return (f'<svg viewBox="0 0 {w} {h}" width="{w * px}" height="{h * px}" shape-rendering="crispEdges" '
-            f'aria-hidden="true" style="display:inline-block;image-rendering:pixelated">{rects}</svg>')
+def logo_icon():
+    """The AiJaga logo (person with stethoscope + heart) as the browser-tab icon."""
+    try:
+        from PIL import Image, ImageDraw
+
+        scale, pad = 6, 6
+        icon = Image.new("RGBA", (17 * scale + pad * 2, 17 * scale + pad * 2), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(icon)
+        for x, y, w, h, fill in re.findall(r'x="(\d+)" y="(\d+)" width="(\d+)" height="(\d+)" fill="(#\w+)"', LOGO_SVG):
+            x, y, w, h = int(x), int(y) + 1, int(w), int(h)
+            draw.rectangle([pad + x * scale, pad + y * scale, pad + (x + w) * scale - 1, pad + (y + h) * scale - 1],
+                           fill=fill)
+        return icon
+    except Exception:
+        return "🩺"
 
 
-def mood_doctor(mood, px=10):
-    mouth = {"happy": "bsmmmmsb", "ok": "bssmmssb", "flat": "bssssssb"}.get(mood, "bssmmssb")
-    rows = ["......rr......", "....hhhhhh....", "...hhhhhhhh...", "...hssssssh...", "...sesssses...",
-            "..." + mouth + "...", "...bbbbbbbb...", "....bbbbbb....", ".kwwwwggwwwwk.", "wwwwwwggwwwwww",
-            "wwrwwwggwwwwww", "wwrwwwggwwwwww", "wwwrrwwggwwwww", "wwwwwwwwwwwwww", "wwwwwwwwwwwwww"]
-    return pix(rows, DOC_PAL, px)
+st.set_page_config(page_title="AiJaga", page_icon=logo_icon(), layout="wide", initial_sidebar_state="collapsed")
 
 
 def svg_url(svg):
@@ -1340,27 +1409,32 @@ def json_for_script(value):
 # ---------------------------------------------------------------------------
 # 8. Session state (remembers things between clicks)
 # ---------------------------------------------------------------------------
+KNOWLEDGE_TO_LEVEL = {"Just starting": "Easy", "I know the basics": "Intermediate", "I know quite a lot": "Advance"}
 DEFAULTS = {
     "page": "home",
     "theme": "bright",
     "profile": dict(PROFILE_DEFAULTS),
     "messages": [],
-    "read_aloud": False,
+    "read_aloud": False,      # Dr. Azmi's voice on/off
     "font_scale": 1.0,
     "auto_start_learning": True,
-    "js_queue": [],          # browser scripts to run on the next render (speech, confetti, to-do sync)
+    "js_queue": [],           # browser scripts to run on the next render (voice, confetti, to-do sync)
     "js_nonce": 0,
+    "upload_nonce": 0,        # changes to clear the photo / voice boxes after sending
     "chat_error": None,
     "chat_note": None,
-    "pending_prompt": None,  # a question waiting to be sent (from chips, quick questions, videos)
+    "pending_prompt": None,   # a question waiting to be sent (from chips, quick questions, videos)
     # quiz
     "xp": 0,
-    "progress": {},          # "Field|Title" -> {"answered": n, "score": n}
+    "progress": {},           # "Field|Title" -> {"answered": n, "score": n}
+    "ai_level": "Easy",       # AI quiz difficulty
     "q_source": "library", "q_title": "", "q_field": 0, "q_topic": 0, "ai_quiz": [],
-    "q_items": [], "q_i": 0, "q_pick": None, "q_score": 0,
+    "q_items": [], "q_i": 0, "q_pick": None, "q_score": 0, "q_results": [],
     "celebrate": False, "play_ding": False, "quiz_notice": None,
     # video
     "v_field": 0, "v_i": 0, "video_seen": set(),
+    # hospitals
+    "hosp_mode": None, "hosp_result": None, "hosp_error": None, "hosp_nonce": 0,
 }
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
@@ -1384,14 +1458,68 @@ def run_js(code):
     S.js_queue.append(code)
 
 
+# A natural-sounding MALE voice: the browser's best male voice is picked by name
+# (Edge "Natural" voices first, then Google/Apple/Windows male voices).
+SPEAK_JS = r"""
+(() => {
+  const synth = window.speechSynthesis;
+  if (!synth) return;
+  const text = __TEXT__;
+  const lang = __LANG__;
+  const malay = [/Osman/i, /Malay.*\bmale\b/i, /ms-MY.*\bmale\b/i];
+  const english = [/Andrew.*Natural/i, /Guy.*Natural/i, /Brian.*Natural/i, /Christopher.*Natural/i,
+                   /Ryan.*Natural/i, /Eric.*Natural/i, /Roger.*Natural/i, /Steffan.*Natural/i, /Thomas.*Natural/i,
+                   /Google UK English Male/i, /Daniel/i, /Microsoft (David|Mark|George|James|Guy)/i,
+                   /\bAlex\b/i, /Aaron/i, /Arthur/i, /Rishi/i, /Fred/i, /\bmale\b/i];
+  const pick = () => {
+    const voices = synth.getVoices();
+    const order = lang.startsWith("ms") ? malay.concat(english) : english;
+    for (const pattern of order) {
+      const found = voices.find((v) => pattern.test(v.name) && (lang.startsWith("ms") || v.lang.toLowerCase().startsWith("en")));
+      if (found) return found;
+    }
+    return voices.find((v) => v.lang.toLowerCase().startsWith(lang.slice(0, 2))) || null;
+  };
+  let started = false;
+  const speakNow = () => {
+    if (started) return;
+    started = true;
+    synth.cancel();
+    const voice = pick();
+    const parts = text.match(/[^.!?\n]+[.!?]*/g) || [text];   // short sentences sound smoother
+    parts.forEach((part) => {
+      part = part.trim();
+      if (!part) return;
+      const u = new SpeechSynthesisUtterance(part);
+      if (voice) { u.voice = voice; u.lang = voice.lang; } else { u.lang = lang; }
+      u.rate = 0.98;
+      u.pitch = 0.92;
+      synth.speak(u);
+    });
+  };
+  if (synth.getVoices().length) speakNow();
+  else { synth.onvoiceschanged = () => { synth.onvoiceschanged = null; speakNow(); }; setTimeout(speakNow, 800); }
+})();
+"""
+
+
 def speak(text):
     lang = "ms-MY" if S.profile.get("language") == "Bahasa Melayu" else "en-GB"
-    run_js("try{const u=new SpeechSynthesisUtterance(" + json_for_script(plain_text(text)) + ");"
-           f"u.lang='{lang}';window.speechSynthesis.cancel();window.speechSynthesis.speak(u);}}catch(e){{}}")
+    run_js(SPEAK_JS.replace("__TEXT__", json_for_script(plain_text(text))).replace("__LANG__", json_for_script(lang)))
+
+
+def stop_voice():
+    run_js("try{window.speechSynthesis.cancel();}catch(e){}")
+
+
+def toggle_voice():
+    S.read_aloud = S.voice_toggle
+    if not S.read_aloud:
+        stop_voice()
 
 
 def flush_js():
-    """Run queued browser scripts (read aloud, confetti, to-do sync) in the page."""
+    """Run queued browser scripts (voice, confetti, to-do sync) in the page."""
     if S.js_queue:
         S.js_nonce += 1
         code = "\n".join(S.js_queue)
@@ -1400,40 +1528,61 @@ def flush_js():
 
 
 # ---------------------------------------------------------------------------
-# 9. Retro "AiJaga TV" styling
+# 9. Retro "AiJaga TV" styling (every colour comes from the theme, so both
+#    BRIGHT and DARK mode stay readable — including Streamlit's own widgets)
 # ---------------------------------------------------------------------------
 def inject_css():
     fs = S.font_scale
-    play_icon = svg_url(
-        f"<svg xmlns='http://www.w3.org/2000/svg' width='120' height='90' viewBox='0 0 12 9' shape-rendering='crispEdges'>"
-        f"<rect width='12' height='9' fill='{C['ink']}'/><rect x='1' y='1' width='10' height='7' fill='{C['chip']}'/>"
-        f"<rect x='4' y='2' width='1' height='5' fill='{C['coral']}'/><rect x='5' y='3' width='1' height='3' fill='{C['coral']}'/>"
-        f"<rect x='6' y='4' width='1' height='1' fill='{C['coral']}'/></svg>")
-    quiz_icon = svg_url(
-        f"<svg xmlns='http://www.w3.org/2000/svg' width='130' height='70' viewBox='0 0 13 7' shape-rendering='crispEdges'>"
-        f"<rect x='1' y='0' width='1' height='1' fill='{C['coral']}'/><rect x='0' y='1' width='1' height='5' fill='{C['coral']}'/>"
-        f"<rect x='1' y='6' width='1' height='1' fill='{C['coral']}'/>"
-        f"<rect x='11' y='0' width='1' height='1' fill='{C['coral']}'/><rect x='12' y='1' width='1' height='5' fill='{C['coral']}'/>"
-        f"<rect x='11' y='6' width='1' height='1' fill='{C['coral']}'/>"
-        f"<rect x='5' y='0' width='3' height='1' fill='{C['ink']}'/><rect x='4' y='1' width='1' height='1' fill='{C['ink']}'/>"
-        f"<rect x='8' y='1' width='1' height='2' fill='{C['ink']}'/><rect x='7' y='3' width='1' height='1' fill='{C['ink']}'/>"
-        f"<rect x='6' y='4' width='1' height='1' fill='{C['ink']}'/><rect x='6' y='6' width='1' height='1' fill='{C['ink']}'/></svg>")
-
     st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Silkscreen:wght@400;700&family=Nunito:wght@500;600;700;800&display=swap');
 
 #MainMenu, header[data-testid="stHeader"], footer {{ visibility: hidden; height: 0; }}
-.stApp {{ background: {C['page']}; }}
+.stApp {{ background: {C['page']}; color-scheme: {'light' if S.theme == 'bright' else 'dark'}; }}
 html, body, .stApp, p, label, li, input, textarea, .stMarkdown {{ font-family: 'Nunito', sans-serif; color: {C['ink']}; }}
-.stApp [data-testid="stCaptionContainer"] p {{ color: {C['sub']}; }}
+.stApp .stMarkdown p:not([class]), .stApp li {{ font-size: calc(1rem * {fs}); }}
+.stApp [data-testid="stCaptionContainer"] p {{ color: {C['muted']}; }}
+[data-testid="InputInstructions"] {{ display: none !important; }}
+
+/* ---- Streamlit's own widgets follow the AiJaga theme ---- */
 .stApp [data-testid="stExpander"] details {{ background: {C['card']}; border: 3px solid {C['ink']}; border-radius: 0; }}
-.stApp [data-testid="stExpander"] summary p {{ font-family: 'Silkscreen', monospace; font-weight: 700; letter-spacing: 1px; }}
-.stApp [data-baseweb="select"] > div {{ background: {C['card']}; border: 2px solid {C['ink']}; border-radius: 0; }}
+.stApp [data-testid="stExpander"] summary, .stApp [data-testid="stExpander"] summary p {{ color: {C['ink']} !important;
+  font-family: 'Silkscreen', monospace; font-weight: 700; letter-spacing: 1px; font-size: 13px; }}
+.stApp [data-testid="stExpander"] summary svg {{ fill: {C['ink']}; color: {C['ink']}; }}
+.stApp [data-baseweb="select"] > div {{ background: {C['card']} !important; border: 2px solid {C['ink']} !important;
+  border-radius: 0 !important; color: {C['ink']} !important; }}
+.stApp [data-baseweb="select"] * {{ color: {C['ink']} !important; }}
+[data-baseweb="popover"] ul, [data-baseweb="popover"] li, [data-baseweb="menu"] {{ background: {C['card']} !important; color: {C['ink']} !important; }}
+[data-baseweb="popover"] li:hover, [data-baseweb="popover"] li[aria-selected="true"] {{ background: {C['chip']} !important; }}
+[data-baseweb="tooltip"], [data-baseweb="tooltip"] > div, [data-testid="stTooltipContent"] {{
+  background: {C['card']} !important; color: {C['ink']} !important; border: 2px solid {C['ink']}; border-radius: 0 !important; }}
+[data-testid="stTooltipContent"] *, [data-baseweb="tooltip"] p {{ color: {C['ink']} !important; }}
+.stApp [data-testid="stAlert"], .stApp [data-testid="stAlertContainer"] {{ background: {C['info_soft']} !important;
+  border: 2px solid {C['ink']}; border-radius: 0 !important; }}
+.stApp [data-testid="stAlert"] *, .stApp [data-testid="stAlertContainer"] * {{ color: {C['ink']} !important; }}
+.stApp [data-testid="stSpinner"] * {{ color: {C['ink']} !important; }}
+.stTextArea textarea, [data-baseweb="textarea"], [data-baseweb="textarea"] textarea {{ background: {C['card']} !important;
+  color: {C['ink']} !important; border-radius: 0 !important; font-size: 16px; }}
+[data-baseweb="textarea"] {{ border: 3px solid {C['ink']} !important; }}
+.stTextArea textarea::placeholder {{ color: {C['muted']} !important; opacity: .85; }}
+[data-testid="stAudioInput"] *:not(button):not(canvas):not(svg):not(path) {{ background-color: transparent !important; }}
+[data-testid="stFileUploaderDropzone"] {{ background: {C['chat_bg']} !important; border: 3px dashed {C['ink']} !important;
+  border-radius: 0 !important; }}
+[data-testid="stFileUploaderDropzone"] *, [data-testid="stFileUploaderFile"] *, [data-testid="stFileUploader"] small {{ color: {C['ink']} !important; }}
+[data-testid="stFileUploaderDropzone"] button {{ background: {C['chip']} !important; color: {C['ink']} !important;
+  border: 2px solid {C['ink']} !important; border-radius: 0 !important; }}
+[data-testid="stFileUploaderFile"] {{ background: {C['chat_bg']}; border: 2px solid {C['ink']}; padding: 6px; }}
+[data-testid="stAudioInput"] > div {{ background: {C['chat_bg']} !important; border: 3px solid {C['ink']} !important; border-radius: 0 !important; }}
+[data-testid="stAudioInput"] * {{ color: {C['ink']} !important; }}
+.stApp [data-testid="stCheckbox"] label p, .stApp [data-testid="stWidgetLabel"] p {{ color: {C['ink']} !important; font-weight: 700; }}
+.stApp [data-testid="stSlider"] *, .stApp [data-baseweb="slider"] div[role="slider"] + div {{ color: {C['ink']}; }}
+.stApp [data-testid="stSliderThumbValue"], .stApp [data-testid="stSliderTickBarMin"],
+.stApp [data-testid="stSliderTickBarMax"] {{ color: {C['ink']} !important; font-weight: 800; }}
+.stApp [data-testid="stSlider"] div[role="slider"] {{ background: {C['coral']} !important; border: 3px solid {C['ink']}; border-radius: 0 !important; }}
 
 /* The TV body and screen */
 .block-container {{
-  max-width: 1280px; margin: 30px auto 0; padding: 26px 30px 30px !important;
+  max-width: 1180px; margin: 30px auto 0; padding: 26px 30px 30px !important;
   background-color: {C['screen']};
   background-image: repeating-linear-gradient(0deg, {C['scan']} 0 2px, transparent 2px 5px);
   border: 8px solid {C['frame_edge']}; border-radius: 28px;
@@ -1441,33 +1590,40 @@ html, body, .stApp, p, label, li, input, textarea, .stMarkdown {{ font-family: '
 }}
 
 .pixel {{ font-family: 'Silkscreen', monospace; font-weight: 700; letter-spacing: 1px; }}
-.sub {{ color: {C['sub']}; }}
+.sub {{ color: {C['muted']}; }}
 h1, h2, h3 {{ font-family: 'Silkscreen', monospace !important; color: {C['ink']} !important; letter-spacing: 1px; }}
-.page-title {{ text-align: center; font-size: 34px; margin: 18px 0 2px; }}
-.page-sub {{ text-align: center; font-family: 'Silkscreen', monospace; font-size: 14px; letter-spacing: 3px;
-             color: {C['sub']}; margin: 0 0 22px; }}
+.page-title {{ text-align: center; font-size: 32px; margin: 14px 0 2px; }}
+.page-sub {{ text-align: center; font-family: 'Silkscreen', monospace; font-size: 13px; letter-spacing: 3px;
+             color: {C['muted']}; margin: 0 0 20px; }}
 
 .card {{ background: {C['card']}; border: 4px solid {C['ink']}; box-shadow: 8px 8px 0 {C['ink']};
          padding: 20px 22px; margin-bottom: 18px; color: {C['ink']}; }}
-.side-card {{ background: {C['card']}; border: 4px solid {C['ink']}; box-shadow: 6px 6px 0 {C['ink']};
-              padding: 14px 16px; margin: 6px 0 10px; color: {C['ink']}; font-size: calc(15px * {fs}); }}
-.side-card p {{ margin: 8px 0 0; }}
+.side-card {{ background: {C['card']}; border: 3px solid {C['ink']}; padding: 12px 14px; margin: 4px 0 10px;
+              color: {C['ink']}; font-size: calc(15px * {fs}); }}
+.side-card p {{ margin: 8px 0 0; color: {C['ink']}; }}
 .tag {{ display: inline-block; padding: 4px 12px; background: {C['coral']}; border: 3px solid {C['ink']};
         color: #1C2B33; font-family: 'Silkscreen', monospace; font-weight: 700; font-size: 13px; letter-spacing: 1px; }}
+.pill {{ display: inline-block; padding: 3px 10px; border: 2px solid {C['ink']}; background: {C['chip']}; color: {C['ink']};
+         font-family: 'Silkscreen', monospace; font-size: 12px; letter-spacing: 1px; }}
 .logo {{ display: flex; align-items: center; gap: 12px; }}
+.notice {{ border: 3px solid {C['ink']}; background: {C['info_soft']}; color: {C['ink']}; padding: 10px 14px;
+           margin: 6px 0 12px; font-weight: 700; font-size: calc(15px * {fs}); }}
+.notice.bad {{ background: {C['bad_soft']}; border-color: {C['bad_text']}; color: {C['ink']}; }}
+.notice.ok {{ background: {C['ok_soft']}; border-color: {C['ok_text']}; }}
 
 /* Buttons: chunky pixel style */
-.stButton > button, .stFormSubmitButton > button, [data-testid="stPopover"] button, .stLinkButton a {{
+.stButton button, .stFormSubmitButton > button, [data-testid="stPopoverButton"], .stLinkButton a {{
   border: 3px solid {C['ink']} !important; border-radius: 0 !important;
   background: {C['chip']} !important; color: {C['ink']} !important;
   box-shadow: 4px 4px 0 {C['ink']}; font-weight: 700; min-height: 46px;
 }}
-.stButton > button:hover, [data-testid="stPopover"] button:hover {{ transform: translate(-2px, -2px); box-shadow: 6px 6px 0 {C['ink']}; }}
-.stButton > button[kind="primary"], .stFormSubmitButton > button {{
+.stButton button:hover, [data-testid="stPopoverButton"]:hover {{ transform: translate(-2px, -2px); box-shadow: 6px 6px 0 {C['ink']}; }}
+.stButton button[kind="primary"], .stFormSubmitButton > button {{
   background: {C['teal']} !important; color: {C['btn_text']} !important;
   font-family: 'Silkscreen', monospace; letter-spacing: 1px;
 }}
-.stButton > button p, .stFormSubmitButton > button p, [data-testid="stPopover"] button p {{ color: inherit !important; white-space: normal; }}
+.stButton button:disabled {{ opacity: .45; transform: none; }}
+.stButton button p, .stFormSubmitButton > button p, [data-testid="stPopover"] button p {{ color: inherit !important; white-space: normal; }}
 .todo-link {{ display: block; text-align: center; margin-top: 8px; padding: 6px 10px; text-decoration: none !important;
               border: 3px solid {C['ink']}; background: {C['card']}; color: {C['ink']} !important;
               box-shadow: 3px 3px 0 {C['ink']}; font-family: 'Silkscreen', monospace; font-size: 12px; letter-spacing: 1px; }}
@@ -1475,86 +1631,120 @@ h1, h2, h3 {{ font-family: 'Silkscreen', monospace !important; color: {C['ink']}
 
 /* Text boxes */
 .stTextInput input {{ border-radius: 0 !important; background: {C['card']} !important; color: {C['ink']} !important; font-size: 17px; }}
-.stTextInput input::placeholder {{ color: {C['sub']}; opacity: .8; }}
-.stTextInput > div > div {{ border: 3px solid {C['ink']} !important; border-radius: 0 !important; }}
+.stTextInput input::placeholder {{ color: {C['muted']}; opacity: .85; }}
+.stTextInput > div > div {{ border: 3px solid {C['ink']} !important; border-radius: 0 !important; background: {C['card']} !important; }}
 
-/* Level / score bar */
-.bar-label {{ font-family: 'Silkscreen', monospace; font-size: 12px; letter-spacing: 2px; color: {C['sub']}; }}
+/* Level bar */
+.bar-label {{ font-family: 'Silkscreen', monospace; font-size: 12px; letter-spacing: 2px; color: {C['muted']}; }}
 .score-bar {{ height: 18px; border: 3px solid {C['ink']}; background: {C['card']}; margin: 6px 0 4px; }}
 .score-fill {{ height: 100%; background: {C['coral']}; transition: width .5s; }}
 
-/* Speech bubble */
-.bubble-hello {{ position: relative; background: {C['card']}; border: 4px solid {C['ink']};
-                 box-shadow: 8px 8px 0 {C['ink']}; padding: 16px 22px; max-width: 520px; }}
-.bubble-hello::before {{ content: ""; position: absolute; left: -22px; top: 14px; border: 11px solid transparent;
-                         border-right-color: {C['ink']}; border-top-color: {C['ink']}; }}
+/* Home hero */
+.hero {{ display: flex; flex-direction: column; align-items: center; gap: 8px; margin: 10px 0 18px; }}
+.hero svg {{ animation: bob 1.6s steps(1) infinite; }}
+@keyframes bob {{ 0%,49% {{ transform: translateY(0); }} 50%,100% {{ transform: translateY(-4px); }} }}
+.hero h1 {{ font-size: 30px; margin: 6px 0 0; color: {C['teal']} !important; text-align: center; }}
+.hero p {{ margin: 0; font-size: 17px; font-weight: 700; color: {C['muted']}; text-align: center; }}
 .dots span {{ display: inline-block; width: 7px; height: 7px; margin-right: 6px; background: {C['coral']};
               animation: blink 1.2s infinite; }}
 .dots span:nth-child(2) {{ animation-delay: .2s; }} .dots span:nth-child(3) {{ animation-delay: .4s; }}
 @keyframes blink {{ 0%, 80%, 100% {{ opacity: .2; }} 40% {{ opacity: 1; }} }}
+
+/* START cover: hover (or tap / tab into it) and it turns into the chatbot */
+.st-key-chat_zone_closed {{ position: relative; }}
+.st-key-chat_zone_closed::before {{
+  content: "▶  START"; position: absolute; inset: -4px; z-index: 30; display: flex; align-items: center; justify-content: center;
+  padding-bottom: 50px; background: {C['teal']}; color: {C['btn_text']}; border: 4px solid {C['ink']};
+  box-shadow: 8px 8px 0 {C['ink']}; font-family: 'Silkscreen', monospace; font-size: clamp(36px, 7vw, 64px);
+  letter-spacing: 8px; cursor: pointer; transition: opacity .2s, visibility 0s .2s;
+}}
+.st-key-chat_zone_closed::after {{
+  content: "Hover or tap here to chat with Dr. Azmi"; position: absolute; left: 0; right: 0; top: calc(50% + 24px);
+  z-index: 31; text-align: center; color: {C['btn_text']}; font-family: 'Nunito', sans-serif; font-weight: 800;
+  font-size: 18px; pointer-events: none; transition: opacity .2s, visibility 0s .2s;
+}}
+.st-key-chat_zone_closed:hover::before, .st-key-chat_zone_closed:hover::after,
+.st-key-chat_zone_closed:focus-within::before, .st-key-chat_zone_closed:focus-within::after,
+body:has([data-testid="stPopoverBody"]) .st-key-chat_zone_closed::before,
+body:has([data-testid="stPopoverBody"]) .st-key-chat_zone_closed::after {{ opacity: 0; visibility: hidden; transition: opacity .2s; }}
 
 /* Chat panel */
 .st-key-chat_panel {{ background: {C['card']}; border: 4px solid {C['ink']}; box-shadow: 8px 8px 0 {C['ink']};
                       padding: 0 16px 14px; gap: 10px; }}
 .chat-head {{ display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;
               margin: 0 -16px; padding: 12px 16px; border-bottom: 3px solid {C['ink']}; }}
-.st-key-chat_log {{ margin-top: 18px; background: {C['chat_bg']}; border: 3px solid {C['ink']} !important; border-radius: 0 !important; }}
+.st-key-chat_log {{ background: {C['chat_bg']}; border: 3px solid {C['ink']} !important; border-radius: 0 !important; }}
 .msg {{ display: flex; gap: 10px; align-items: flex-start; margin: 4px 0 2px; }}
 .msg.user {{ justify-content: flex-end; }}
-.avatar {{ flex: none; width: 42px; height: 42px; border: 3px solid {C['ink']}; background: {C['chip']};
+.avatar {{ flex: none; width: 44px; height: 50px; border: 3px solid {C['ink']}; background: {C['chip']};
            display: flex; align-items: center; justify-content: center; }}
 .bubble {{ border: 3px solid {C['ink']}; box-shadow: 4px 4px 0 {C['ink']}; padding: 10px 14px;
-           max-width: 78%; line-height: 1.5; font-size: calc(16px * {fs}); }}
+           max-width: 78%; line-height: 1.5; font-size: calc(16px * {fs}); overflow-wrap: anywhere; }}
 .bubble.bot {{ background: {C['card']}; color: {C['ink']}; }}
 .bubble.user {{ background: {C['teal']}; color: {C['btn_text']}; }}
 .bubble code {{ background: {C['chip']}; color: {C['ink']}; padding: 0 4px; }}
 .bubble .alert {{ display: block; background: {C['bad']}; color: #fff; padding: 6px 8px; margin: 2px 0 8px; font-weight: 800; }}
 .who {{ display: block; font-family: 'Silkscreen', monospace; font-size: 10px; letter-spacing: 2px; margin-bottom: 3px; opacity: .85; }}
-.st-key-chat_log .stButton > button {{ min-height: 34px; padding: 2px 12px; margin-left: 52px; box-shadow: 3px 3px 0 {C['ink']}; font-size: 14px; }}
+.st-key-chat_log .stButton button {{ min-height: 34px; padding: 2px 12px; margin-left: 56px; box-shadow: 3px 3px 0 {C['ink']}; font-size: 14px; }}
 .st-key-chat_log [class*="st-key-chip_"] button {{ margin-left: 0 !important; min-height: 32px; font-size: 13px; width: 100%; }}
 .st-key-chat_log [class*="st-key-chatquiz_"] button {{ background: {C['coral']} !important; color: #1C2B33 !important; }}
 .st-key-chat_log [data-testid="stImage"] img {{ border: 3px solid {C['ink']}; }}
-.st-key-chat_panel [data-testid="InputInstructions"] {{ display: none; }}
 .st-key-chat_panel .stTextInput input {{ min-height: 48px; padding: 10px 14px; }}
 .st-key-chat_panel .stFormSubmitButton > button,
-.st-key-chat_panel [data-testid="stPopover"] button {{ min-height: 54px; }}
-[data-testid="stPopover"] button {{ font-size: 24px; padding: 0; justify-content: center; }}
-[data-testid="stPopover"] button p {{ font-size: 24px; font-weight: 700; }}
+.st-key-chat_panel [data-testid="stPopoverButton"] {{ min-height: 54px; width: 100%; font-size: 24px; padding: 0; justify-content: center; }}
+.st-key-chat_panel [data-testid="stPopoverButton"] p {{ font-size: 26px; font-weight: 800; }}
 [data-testid="stPopover"] button [data-testid="stIconMaterial"] {{ display: none; }}
-[data-testid="stPopoverBody"] {{ background: {C['card']}; border: 3px solid {C['ink']}; border-radius: 0; }}
-.quick-label {{ font-family: 'Silkscreen', monospace; font-size: 11px; letter-spacing: 2px; color: {C['sub']}; }}
+[data-testid="stPopoverBody"] {{ background: {C['card']} !important; border: 3px solid {C['ink']} !important; border-radius: 0 !important;
+  min-width: min(380px, 92vw); max-width: 440px; padding: 16px !important; }}
+[data-testid="stPopoverBody"] * {{ color: {C['ink']}; }}
+[data-testid="stPopoverBody"] [data-testid="stVerticalBlock"] {{ gap: 12px; }}
+[data-testid="stPopoverBody"] [data-testid="stImage"] img {{ border: 3px solid {C['ink']}; max-height: 180px; object-fit: contain; }}
+.pop-title {{ font-family: 'Silkscreen', monospace; font-size: 13px; letter-spacing: 2px; color: {C['ink']};
+              border-bottom: 2px solid {C['ink']}; padding-bottom: 4px; margin-top: 4px; }}
+.st-key-voice_row [data-testid="stCheckbox"] label p {{ font-family: 'Silkscreen', monospace; font-size: 12px; letter-spacing: 1px; }}
+/* On/off switches */
+.stApp [data-testid="stCheckbox"] label:has(input[role="switch"]) > div:not([data-testid]) {{
+  background: {C['chip']} !important; border: 2px solid {C['ink']}; }}
+.stApp [data-testid="stCheckbox"] label:has(input[role="switch"]:checked) > div:not([data-testid]) {{ background: {C['teal']} !important; }}
+.stApp [data-testid="stCheckbox"] label:has(input[role="switch"]) > div:not([data-testid]) > div {{
+  background: {C['card']} !important; border: 2px solid {C['ink']}; }}
+.quick-label {{ margin: 8px 0 2px; font-family: 'Silkscreen', monospace; font-size: 11px; letter-spacing: 2px; color: {C['muted']}; }}
 [class*="st-key-quick_"] button {{ min-height: 38px; font-size: 14px; box-shadow: 3px 3px 0 {C['ink']}; }}
 
-/* Big VIDEO and QUIZ buttons on the main page */
-.st-key-open_video button, .st-key-open_quiz button {{
-  height: 170px; width: 100%; flex-direction: column; gap: 10px; background: {C['card']} !important;
-  border: 4px solid {C['ink']} !important; box-shadow: 8px 8px 0 {C['ink']};
-  font-family: 'Silkscreen', monospace; font-size: 26px; letter-spacing: 3px;
-}}
-.st-key-open_video button::before, .st-key-open_quiz button::before {{
-  content: ""; display: block; width: 96px; height: 72px; background-repeat: no-repeat; background-position: center;
-  background-size: contain; image-rendering: pixelated;
-}}
-.st-key-open_video button::before {{ background-image: {play_icon}; }}
-.st-key-open_quiz button::before {{ background-image: {quiz_icon}; height: 56px; width: 104px; }}
-.st-key-open_video button:hover, .st-key-open_quiz button:hover {{
-  transform: translate(-3px, -3px); box-shadow: 11px 11px 0 {C['coral']}; }}
-.st-key-open_video button p, .st-key-open_quiz button p {{ font-size: 26px; color: {C['ink']} !important; }}
+/* Other tools: light, see-through buttons that don't compete with the chat */
+.tools-label {{ text-align: center; font-family: 'Silkscreen', monospace; font-size: 11px; letter-spacing: 3px;
+                color: {C['muted']}; margin: 22px 0 4px; }}
+[class*="st-key-tool_"] button {{ background: {C['glass']} !important; border: 3px solid {C['glass_line']} !important;
+  box-shadow: none !important; color: {C['muted']} !important; font-family: 'Silkscreen', monospace; letter-spacing: 2px;
+  min-height: 56px; }}
+[class*="st-key-tool_"] button p {{ font-size: 15px !important; }}
+[class*="st-key-tool_"] button:hover {{ border-color: {C['ink']} !important; color: {C['ink']} !important;
+  background: {C['card']} !important; transform: none; }}
+.st-key-settings_row [data-testid="stExpander"] details {{ background: {C['glass']}; border: 2px solid {C['glass_line']}; }}
+.st-key-settings_row [data-testid="stExpander"] summary, .st-key-settings_row [data-testid="stExpander"] summary p {{ color: {C['muted']} !important; font-size: 12px; }}
 [class*="st-key-coach_"] button {{ min-height: 38px; font-size: 14px; box-shadow: 3px 3px 0 {C['ink']}; }}
 
 /* Tiles (fields, topics, videos) */
 [class*="st-key-tile_"], [class*="st-key-tiledone_"] {{
   background: {C['card']}; border: 4px solid {C['ink']}; box-shadow: 6px 6px 0 {C['ink']};
-  padding: 14px 14px 16px; gap: 10px; margin-bottom: 14px;
+  padding: 14px 14px 16px; gap: 8px; margin-bottom: 14px;
 }}
 [class*="st-key-tiledone_"] {{ background: {C['done_bg']}; border-color: {C['done_line']}; box-shadow: 6px 6px 0 {C['done_line']}; }}
-.tile-title {{ font-family: 'Silkscreen', monospace; font-weight: 700; font-size: 16px; letter-spacing: 1px;
-               color: {C['teal']}; text-align: center; line-height: 1.35; min-height: 44px;
+.tile-icon {{ text-align: center; font-size: 30px; line-height: 1.1; }}
+.tile-title {{ font-family: 'Silkscreen', monospace; font-weight: 700; font-size: 15px; letter-spacing: 1px;
+               color: {C['teal']}; text-align: center; line-height: 1.35; min-height: 42px;
                display: flex; align-items: center; justify-content: center; margin: 0; }}
-.tile-count {{ display: block; text-align: center; color: {C['sub']}; font-weight: 700; font-size: 15px; }}
+.tile-count {{ display: block; text-align: center; color: {C['muted']}; font-weight: 700; font-size: 14px; }}
 [class*="st-key-tiledone_"] .tile-title, [class*="st-key-tiledone_"] .tile-count {{ color: {C['done_ink']}; }}
-.mini {{ height: 12px; border: 2px solid {C['ink']}; background: {C['card']}; margin: 6px 0; }}
+.mini {{ height: 14px; border: 2px solid {C['ink']}; background: {C['card']}; margin: 4px 0 2px; position: relative; }}
 .mini i {{ display: block; height: 100%; background: {C['coral']}; }}
+[class*="st-key-tiledone_"] .mini {{ border-color: {C['done_line']}; }}
+[class*="st-key-tiledone_"] .mini i {{ background: {C['done_line']}; }}
+.pct {{ display: block; margin: 4px 0 8px; text-align: center; font-family: 'Silkscreen', monospace; font-size: 13px; color: {C['ink']}; }}
+[class*="st-key-tiledone_"] .pct {{ color: {C['done_ink']}; }}
+[class*="st-key-tiledone_"] .stButton button {{ background: {C['done_bg']} !important; color: {C['done_ink']} !important;
+  border-color: {C['done_line']} !important; box-shadow: 3px 3px 0 {C['done_line']}; }}
+[class*="st-key-aiq_"] button {{ background: {C['card']} !important; }}
 .thumb {{ position: relative; display: block; width: 100%; aspect-ratio: 16/9; overflow: hidden;
           background: {C['chip']}; border: 3px solid {C['ink']}; }}
 .thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
@@ -1562,31 +1752,78 @@ h1, h2, h3 {{ font-family: 'Silkscreen', monospace !important; color: {C['ink']}
             color: #fff; font-size: 28px; background: rgba(27,42,53,.28); }}
 .thumb .seen {{ position: absolute; inset: 6px 6px auto auto; font-size: 11px; padding: 2px 6px; }}
 
-/* Quiz answers */
+/* AI quiz maker */
+.st-key-ai_maker {{ background: {C['card']}; border: 4px solid {C['ink']}; box-shadow: 6px 6px 0 {C['coral']};
+                    padding: 14px 18px 16px; gap: 10px; margin-bottom: 20px; }}
+.maker-title {{ font-family: 'Silkscreen', monospace; font-size: 16px; letter-spacing: 2px; color: {C['ink']}; }}
+
+/* Quiz play */
+.quiz-head {{ background: {C['card']}; border: 4px solid {C['ink']}; box-shadow: 6px 6px 0 {C['ink']};
+              padding: 14px 18px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }}
+.quiz-head .qt {{ font-family: 'Silkscreen', monospace; font-size: 18px; letter-spacing: 1px; color: {C['ink']}; }}
+.qdots {{ display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }}
+.qdot {{ width: 22px; height: 22px; border: 3px solid {C['ink']}; background: {C['card']}; display: inline-flex;
+         align-items: center; justify-content: center; font-size: 11px; font-weight: 800; color: {C['ink']}; }}
+.qdot.ok {{ background: {C['ok']}; color: #fff; }}
+.qdot.bad {{ background: {C['bad']}; color: #fff; }}
+.qdot.past {{ background: {C['chip']}; }}
+.qdot.now {{ background: {C['coral']}; color: #1C2B33; }}
+.score-chip {{ font-family: 'Silkscreen', monospace; font-size: 14px; color: {C['ink']}; background: {C['chip']};
+               border: 3px solid {C['ink']}; padding: 6px 10px; }}
+.qcard {{ position: relative; background: {C['card']}; border: 4px solid {C['ink']}; box-shadow: 8px 8px 0 {C['ink']};
+          padding: 30px 24px 22px; margin: 26px 0 16px; }}
+.qcard .qnum {{ position: absolute; top: -18px; left: 16px; }}
+.qcard .qtext {{ margin: 0; font-size: calc(22px * {fs}); font-weight: 800; line-height: 1.35; color: {C['ink']}; }}
 [class*="st-key-opt_"] button, [class*="st-key-optok_"] button,
 [class*="st-key-optbad_"] button, [class*="st-key-optdim_"] button {{
-  justify-content: flex-start; text-align: left; min-height: 56px; padding: 10px 16px; }}
+  justify-content: flex-start; text-align: left; min-height: 58px; padding: 10px 16px; background: {C['card']} !important; }}
 [class*="st-key-opt_"] button p, [class*="st-key-optok_"] button p,
 [class*="st-key-optbad_"] button p, [class*="st-key-optdim_"] button p {{ font-size: calc(17px * {fs}); font-weight: 800; text-align: left; }}
+[class*="st-key-opt"] button > div, [class*="st-key-opt"] button div[data-testid="stMarkdownContainer"] {{
+  justify-content: flex-start !important; text-align: left; width: 100%; }}
+[class*="st-key-opt_"] button:hover {{ background: {C['chip']} !important; }}
 [class*="st-key-optok_"] button {{ background: {C['ok']} !important; color: #fff !important; animation: pop .5s ease-out; }}
 [class*="st-key-optbad_"] button {{ background: {C['bad']} !important; color: #fff !important; animation: shake .45s ease-in-out; }}
-[class*="st-key-optdim_"] button {{ opacity: .55; }}
-@keyframes pop {{ 0% {{ transform: scale(1); }} 40% {{ transform: scale(1.04) translateY(-4px); }} 100% {{ transform: scale(1); }} }}
+[class*="st-key-optdim_"] button {{ opacity: .5; }}
+@keyframes pop {{ 0% {{ transform: scale(1); }} 40% {{ transform: scale(1.03) translateY(-4px); }} 100% {{ transform: scale(1); }} }}
 @keyframes shake {{ 0%,100% {{ transform: translateX(0); }} 25% {{ transform: translateX(-7px); }} 50% {{ transform: translateX(7px); }} 75% {{ transform: translateX(-4px); }} }}
+.feedback {{ border: 3px solid {C['ink']}; border-left-width: 12px; padding: 12px 16px; margin: 16px 0 14px;
+             color: {C['ink']}; font-size: calc(16px * {fs}); line-height: 1.5; }}
+.feedback b.head {{ display: block; font-family: 'Silkscreen', monospace; letter-spacing: 1px; font-size: 15px; margin-bottom: 4px; }}
+.feedback.ok {{ background: {C['ok_soft']}; border-color: {C['ok_text']}; }}
+.feedback.ok b.head {{ color: {C['ok_text']}; }}
+.feedback.bad {{ background: {C['bad_soft']}; border-color: {C['bad_text']}; }}
+.feedback.bad b.head {{ color: {C['bad_text']}; }}
+.feedback span {{ color: {C['ink']}; }}
 .st-key-ding {{ display: none; }}
+[class*="st-key-back_"] button {{ min-height: 38px; font-size: 13px; box-shadow: 3px 3px 0 {C['ink']}; }}
 
 /* Quiz result */
-.result {{ text-align: center; margin-top: 10px; }}
-.result-score {{ font-family: 'Silkscreen', monospace; font-size: 18px; letter-spacing: 2px; color: {C['sub']}; margin: 14px 0 6px; }}
-.result-msg {{ font-family: 'Silkscreen', monospace; font-size: 30px; letter-spacing: 2px; line-height: 1.4; margin: 0 0 18px; }}
+.result {{ text-align: center; }}
+.result-score {{ font-family: 'Silkscreen', monospace; font-size: 48px; color: {C['ink']}; margin: 8px 0 0; }}
+.result-pct {{ font-family: 'Silkscreen', monospace; font-size: 16px; letter-spacing: 2px; color: {C['muted']}; margin: 0 0 8px; }}
+.result-msg {{ font-family: 'Silkscreen', monospace; font-size: 24px; letter-spacing: 1px; line-height: 1.4; margin: 6px 0 12px; color: {C['ink']}; }}
 .result-msg.win {{ color: {C['teal']}; }}
 .hop {{ display: inline-block; animation: hop 1s ease-in-out infinite; }}
 @keyframes hop {{ 0%,100% {{ transform: translateY(0); }} 50% {{ transform: translateY(-10px); }} }}
 
+/* Hospitals */
+.hosp-card {{ display: flex; gap: 14px; align-items: flex-start; background: {C['card']}; border: 4px solid {C['ink']};
+              box-shadow: 6px 6px 0 {C['ink']}; padding: 14px 16px; margin: 0 0 16px; color: {C['ink']}; }}
+.hosp-rank {{ flex: none; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+              background: {C['coral']}; border: 3px solid {C['ink']}; font-family: 'Silkscreen', monospace; font-size: 20px; color: #1C2B33; }}
+.hosp-name {{ font-weight: 800; font-size: 18px; color: {C['ink']}; }}
+.hosp-addr {{ font-size: 14px; color: {C['muted']}; margin: 2px 0 6px; }}
+.hosp-dist {{ font-size: 15px; font-weight: 800; color: {C['ink']}; margin-bottom: 8px; }}
+.hosp-card a {{ display: inline-block; padding: 6px 12px; border: 3px solid {C['ink']}; background: {C['teal']};
+               color: {C['btn_text']} !important; text-decoration: none; font-family: 'Silkscreen', monospace; font-size: 12px; }}
+.hosp-map {{ width: 100%; height: 320px; border: 4px solid {C['ink']}; display: block; }}
+.hosp-status {{ font-weight: 700; color: {C['ink']}; }}
+
 /* Video player */
 .vframe {{ width: 100%; aspect-ratio: 16/9; background: #000; border: 4px solid {C['ink']}; box-shadow: 6px 6px 0 {C['ink']}; }}
 .vframe iframe {{ width: 100%; height: 100%; border: 0; display: block; }}
-.vhint {{ font-size: 14px; color: {C['sub']}; margin: 10px 0 0; }}
+.vhint {{ font-size: 14px; color: {C['muted']}; margin: 10px 0 0; }}
 .vhint a {{ color: {C['teal']}; font-weight: 800; }}
 
 .tv-footer {{ display: flex; justify-content: space-between; align-items: center;
@@ -1594,7 +1831,7 @@ h1, h2, h3 {{ font-family: 'Silkscreen', monospace !important; color: {C['ink']}
 .grille span {{ display: inline-block; width: 8px; height: 36px; margin-right: 8px; border-radius: 3px; background: {C['frame_edge']}; }}
 .knob {{ display: inline-block; width: 40px; height: 40px; border-radius: 50%; background: {C['frame_edge']}; margin-left: 14px; }}
 .led {{ display: inline-block; width: 13px; height: 13px; border-radius: 50%; background: {C['coral']}; margin-left: 14px; }}
-.disclaimer {{ text-align: center; font-size: 14px; color: {C['sub']}; margin-top: 18px; }}
+.disclaimer {{ text-align: center; font-size: 14px; color: {C['muted']}; margin-top: 18px; }}
 
 @media (max-width: 700px) {{
   .block-container {{ margin: 12px auto 0; padding: 14px 12px 20px !important; border-width: 5px; border-radius: 16px;
@@ -1612,14 +1849,25 @@ h1, h2, h3 {{ font-family: 'Silkscreen', monospace !important; color: {C['ink']}
 # ---------------------------------------------------------------------------
 # 10. Shared pieces
 # ---------------------------------------------------------------------------
+def library_tier(level):
+    return "Easy" if level <= 3 else "Intermediate" if level <= 6 else "Advance"
+
+
 def level_info():
+    """'LEVEL 2 · EASY' — AI quizzes show their own difficulty (Easy ... Master)."""
     level = 1 + S.xp // 10
-    return f"LEVEL {level} · HEALTH HERO · {S.xp} XP", (S.xp % 10) * 10
+    in_ai_quiz = S.page in ("quiz_play", "quiz_result") and S.q_source == "ai"
+    tier = S.ai_level if in_ai_quiz else library_tier(level)
+    return f"LEVEL {level} · {tier.upper()} · {S.xp} XP", (S.xp % 10) * 10
 
 
 def bar_html(label, pct):
     return (f"<div class='bar-label'>{esc(label)}</div>"
             f"<div class='score-bar'><div class='score-fill' style='width:{round(pct)}%'></div></div>")
+
+
+def notice(text, kind="info"):
+    st.markdown(f"<div class='notice {kind}'>{esc(text)}</div>", unsafe_allow_html=True)
 
 
 TODO_LINK_HTML = """
@@ -1641,8 +1889,8 @@ TODO_LINK_HTML = """
 """
 
 
-def top_bar(bar=None):
-    """Logo (+ HOME), a level/score bar, the theme switch and the to-do list link."""
+def top_bar():
+    """Logo (+ HOME), the level bar, the theme switch and the to-do list link."""
     left, mid, right = st.columns([2.4, 2, 1.6], vertical_alignment="center")
     with left:
         if S.page != "home":
@@ -1654,8 +1902,7 @@ def top_bar(bar=None):
                       f"<span class='pixel' style='font-size:28px;letter-spacing:4px'>AIJAGA</span></div>",
                       unsafe_allow_html=True)
     with mid:
-        label, pct = bar if bar else level_info()
-        st.markdown(bar_html(label, pct), unsafe_allow_html=True)
+        st.markdown(bar_html(*level_info()), unsafe_allow_html=True)
     with right:
         b, d = st.columns(2)
         b.button("BRIGHT", key=f"bright_{S.page}", use_container_width=True,
@@ -1740,9 +1987,21 @@ def themed(snippet):
     return snippet
 
 
+def mascot(width=88):
+    return DOCTOR_SVG.format(w=width, h=round(width * 20 / 16))
+
+
+MASCOT_IMG = ("<img alt='' width='30' height='38' style='image-rendering:pixelated' src='data:image/svg+xml;base64,"
+              + base64.b64encode(DOCTOR_SVG.format(w=30, h=38).replace("<svg ", "<svg xmlns='http://www.w3.org/2000/svg' ", 1)
+                                 .encode()).decode() + "'>")
+
+
 # ---------------------------------------------------------------------------
 # 11. Quiz logic
 # ---------------------------------------------------------------------------
+FIELD_ICONS = ["🧠", "🥗", "🦠", "❤️", "🩹", "💭", "⛑️", "⭐"]
+
+
 def qkey(fi, qi):
     return FIELDS[fi]["name"] + "|" + FIELDS[fi]["quizzes"][qi]["title"]
 
@@ -1757,12 +2016,16 @@ def get_status(fi, qi):
     p = S.progress.get(qkey(fi, qi))
     answered = max(0, min(total, p["answered"])) if p else 0
     score = max(0, min(answered, p["score"])) if p else 0
-    if answered == 0:
-        return {"kind": "new", "total": total}
-    if answered >= total:
-        return {"kind": "done", "answered": answered, "score": score, "total": total}
-    return {"kind": "part", "answered": answered, "score": score, "total": total,
-            "pct": round(answered / total * 100), "left": total - answered}
+    pct = round(answered / total * 100)
+    kind = "new" if answered == 0 else "done" if answered >= total else "part"
+    return {"kind": kind, "answered": answered, "score": score, "total": total, "pct": pct, "left": total - answered}
+
+
+def field_percent(fi):
+    f = FIELDS[fi]
+    answered = sum(get_status(fi, qi)["answered"] for qi in range(len(f["quizzes"])))
+    total = sum(total_of(fi, qi) for qi in range(len(f["quizzes"])))
+    return round(answered / total * 100) if total else 0
 
 
 def make_items(questions):
@@ -1782,17 +2045,17 @@ def start_quiz(fi, qi):
     S.update(q_source="library", q_title=z["title"], q_field=fi, q_topic=qi,
              q_items=make_items(z["questions"][:total_of(fi, qi)]), q_pick=None, celebrate=False,
              q_i=status["answered"] if resume else 0, q_score=status["score"] if resume else 0,
-             page="quiz_play")
+             q_results=[None] * status["answered"] if resume else [], page="quiz_play", quiz_notice=None)
 
 
 def start_ai_quiz(questions=None, title=None):
-    """Quiz made by the AI from the chat (questions in ai_engine format)."""
+    """Quiz written by the AI (questions in ai_engine format). No arguments = replay the last one."""
     if questions is not None:
         S.ai_quiz = [{"q": q["question"], "answer": q["options"][q["answer"]], "options": q["options"],
                       "explain": q["explanation"]} for q in questions]
-        S.q_title = title or "Quiz from your chat"
-    S.update(q_source="ai", q_items=make_items(S.ai_quiz), q_i=0, q_score=0, q_pick=None,
-             celebrate=False, page="quiz_play")
+        S.ai_title = title or "Quiz from your chat"
+    S.update(q_source="ai", q_title=S.get("ai_title", "AI quiz"), q_items=make_items(S.ai_quiz), q_i=0, q_score=0,
+             q_pick=None, q_results=[], celebrate=False, page="quiz_play")
 
 
 def library_quiz_for(topic):
@@ -1804,20 +2067,30 @@ def library_quiz_for(topic):
 
 
 def quiz_from_chat(topic):
-    """Make a quiz from Dr. Azmi's latest explanation. If that isn't possible,
-    open the matching library quiz instead and explain why."""
+    """AI quiz from Dr. Azmi's latest explanation; falls back to the matching library quiz."""
     if any(m["role"] == "user" for m in S.messages):
         try:
-            questions = generate_quiz_from_chat(S.profile, S.messages, topic)
-            start_ai_quiz(questions, f"{topic} quiz from your chat")
+            questions = generate_quiz_from_chat(S.profile, S.messages, topic, difficulty=S.ai_level)
+            start_ai_quiz(questions, f"{topic} · from your chat")
             return
         except (RuntimeError, ValueError) as error:
             reason = str(error)
     else:
-        reason = "You haven't chatted yet."
+        reason = "You haven't chatted with Dr. Azmi yet."
     fi, qi = library_quiz_for(topic)
     start_quiz(fi, qi)
     S.quiz_notice = f"{reason} Here's the {FIELDS[fi]['quizzes'][qi]['title']} quiz from the library instead."
+
+
+def quiz_from_topic(topic):
+    """Fresh 5-question AI quiz about any topic; falls back to the matching library quiz."""
+    try:
+        questions = generate_quiz_from_topic(S.profile, topic, S.ai_level)
+        start_ai_quiz(questions, topic)
+    except RuntimeError as error:
+        fi, qi = library_quiz_for(topic)
+        start_quiz(fi, qi)
+        S.quiz_notice = f"{error} Here's the {FIELDS[fi]['quizzes'][qi]['title']} quiz from the library instead."
 
 
 def choose_answer(k):
@@ -1825,7 +2098,9 @@ def choose_answer(k):
         return
     S.q_pick = k
     item = S.q_items[S.q_i]
-    if item["opts"][k] == item["answer"]:
+    correct = item["opts"][k] == item["answer"]
+    S.q_results = S.q_results[:S.q_i] + [correct]
+    if correct:
         S.q_score += 1
         S.xp += 1
         S.play_ding = True
@@ -1838,7 +2113,8 @@ def next_question():
     S.q_i += 1
     if S.q_i >= len(S.q_items):
         S.page = "quiz_result"
-        S.celebrate = S.q_score >= len(S.q_items) - 1
+        # Confetti only for AI quizzes with at least 2 correct answers (2/5 ... 5/5)
+        S.celebrate = S.q_source == "ai" and S.q_score >= 2
 
 
 def open_video(title):
@@ -1859,11 +2135,11 @@ def bot_bubble_html(text, alert=False, typing=False):
     body = ("<div class='dots' aria-label='Dr. Azmi is typing'><span></span><span></span><span></span></div>"
             if typing else md_to_html(text))
     warn = f"<span class='alert'>⚠ {EMERGENCY_NOTE}</span>" if alert else ""
-    return (f"<div class='msg'><div class='avatar'>{MINI_DOCTOR_SVG}</div>"
+    return (f"<div class='msg'><div class='avatar'>{MASCOT_IMG}</div>"
             f"<div class='bubble bot'><span class='who'>DR. AZMI</span>{warn}{body}</div></div>")
 
 
-def render_user(msg, key):
+def render_user(msg):
     if msg.get("image"):
         _, img = st.columns([2, 1])
         img.image(msg["image"]["data"], use_container_width=True)
@@ -1872,7 +2148,7 @@ def render_user(msg, key):
 
 
 def run_chat_turn(prompt, live, image=None):
-    """Send one question to the AI and stream the answer into the chat."""
+    """Send one question (and optional photo) to the AI and stream the answer into the chat."""
     user = {"role": "user", "content": prompt}
     if image:
         user["image"] = {"data": image[0], "mime_type": image[1]}
@@ -1884,7 +2160,7 @@ def run_chat_turn(prompt, live, image=None):
 
     reply = ""
     with live.container():
-        render_user(user, "live")
+        render_user(user)
         bubble = st.empty()
         bubble.html(bot_bubble_html("", emergency, typing=True))
         for chunk in stream_reply(S.profile, S.messages, image=image):
@@ -1894,9 +2170,12 @@ def run_chat_turn(prompt, live, image=None):
     failed = reply.startswith("⚠️")
     chips = []
     if failed:
+        if image:
+            reply += ("\n\nPhoto analysis needs a working GEMINI_API_KEY (or Groq's vision model). "
+                      "Open ⚙ AI connection below to check your keys.")
         library, chips = library_reply(prompt, hit, emergency)
         reply += "\n\nMeanwhile, from the AiJaga library:\n" + library
-        S.chat_note = "Check your API keys in .streamlit/secrets.toml, or open the AI connection check."
+        S.chat_note = "Check your API keys in .streamlit/secrets.toml, or open ⚙ AI connection below."
 
     S.messages.append({"role": "assistant", "content": reply, "alert": emergency, "chips": chips,
                        "quiz": [hit["fi"], hit["qi"]] if hit else None})
@@ -1918,7 +2197,7 @@ def run_chat_turn(prompt, live, image=None):
     if S.auto_start_learning and plan["auto_start"]:  # "quiz me ..." -> start a quiz right away
         with st.spinner("Dr. Azmi is making your quiz..."):
             quiz_from_chat(plan["topic"])
-        S.quiz_notice = (S.quiz_notice or f"Dr. Azmi started a {plan['topic']} quiz based on your chat.") + \
+        S.quiz_notice = (S.quiz_notice or f"Dr. Azmi made a {S.ai_level} quiz from your chat.") + \
             " Press HOME to go back to the chat."
 
 
@@ -1929,17 +2208,23 @@ def chat_box():
                     "<span class='pixel sub' style='font-size:12px'>"
                     f"<span style='display:inline-block;width:10px;height:10px;background:{C['online']};margin-right:8px'></span>"
                     "DR. AZMI IS ONLINE</span></div>", unsafe_allow_html=True)
-        if S.chat_error:
-            st.warning(S.chat_error)
-        if S.chat_note:
-            st.caption(S.chat_note)
+        with st.container(key="voice_row"):
+            note, voice_col = st.columns([3, 1.3], vertical_alignment="center")
+            with note:
+                if S.chat_error:
+                    notice(S.chat_error, "bad")
+                elif S.chat_note:
+                    st.caption(S.chat_note)
+            voice_col.toggle("🔊 DR. AZMI'S VOICE", value=S.read_aloud, key="voice_toggle", on_change=toggle_voice,
+                             help="Turn on to hear Dr. Azmi read his replies aloud. Turn off to stop.")
 
         # Message history (scrolls when it gets long)
         with st.container(height=380, key="chat_log"):
             for i, msg in enumerate(S.messages):
                 if msg["role"] == "assistant":
                     st.html(bot_bubble_html(msg["content"], msg.get("alert")))
-                    st.button("🔊 Listen", key=f"listen_{i}", on_click=speak, args=(msg["content"],))
+                    if S.read_aloud:
+                        st.button("🔊 Listen", key=f"listen_{i}", on_click=speak, args=(msg["content"],))
                     if msg.get("quiz"):
                         fi, qi = msg["quiz"]
                         st.button(f"? TAKE THE QUIZ: {FIELDS[fi]['quizzes'][qi]['title']}", key=f"chatquiz_{i}",
@@ -1950,7 +2235,7 @@ def chat_box():
                             col.button(title, key=f"chip_{i}_{k}", on_click=S.update,
                                        kwargs={"pending_prompt": f"Tell me about {title}"})
                 else:
-                    render_user(msg, i)
+                    render_user(msg)
             live = st.empty()
 
         # Quick questions
@@ -1960,16 +2245,28 @@ def chat_box():
             if col.button(q, key=f"quick_{k}", use_container_width=True):
                 prompt = q
 
-        # "+" attach button (photo / voice note), typing box and SEND
+        # "+" (photo / voice note), typing box and SEND
+        n = S.upload_nonce
         plus, rest = st.columns([1, 9], vertical_alignment="bottom")
-        with plus.popover("+", help="Add a photo or voice note", use_container_width=True):
-            photo = st.file_uploader("Send a photo", type=["png", "jpg", "jpeg", "webp"], key="photo")
-            caption = st.text_input("Question about the photo (optional)", key="photo_caption")
-            if photo is not None and st.button("Send photo", key="send_photo", type="primary"):
-                image = (photo.getvalue(), photo.type or "image/jpeg")
-                prompt = caption.strip() or "Please describe this image and share general health information. Do not diagnose."
-            voice = st.audio_input("Record a voice note", key="voice")
-            if voice is not None and st.button("Send voice note", key="send_voice", type="primary"):
+        with plus.popover("+", help="Add a photo or a voice note", use_container_width=True):
+            st.markdown("<div class='pop-title'>📷 PHOTO FOR DR. AZMI TO CHECK</div>", unsafe_allow_html=True)
+            photo = st.file_uploader("Choose a photo", type=["png", "jpg", "jpeg", "webp"], key=f"photo_{n}",
+                                     label_visibility="collapsed")
+            if photo is not None:
+                st.image(photo.getvalue(), width=180)
+            photo_q = st.text_area("What do you want to know about this photo? (optional)", key=f"photo_q_{n}",
+                                   height=80, placeholder="e.g. Why did my hand become itchy?")
+            if st.button("ANALYSE PHOTO ▸", key="send_photo", type="primary", disabled=photo is None,
+                         use_container_width=True):
+                image = prepare_image(photo.getvalue(), photo.type or "image/jpeg")
+                prompt = (photo_q.strip() or "Please look at this photo and share general health information "
+                                             "about what you see. Do not diagnose.")
+                S.upload_nonce += 1
+
+            st.markdown("<div class='pop-title'>🎙 VOICE NOTE</div>", unsafe_allow_html=True)
+            voice = st.audio_input("Record a voice note", key=f"voice_{n}", label_visibility="collapsed")
+            if st.button("SEND VOICE NOTE ▸", key="send_voice", type="primary", disabled=voice is None,
+                         use_container_width=True):
                 try:
                     with st.spinner("Listening to your voice note..."):
                         prompt = transcribe_audio(voice.getvalue(), voice.type or "audio/wav")
@@ -1979,6 +2276,8 @@ def chat_box():
                     print("VOICE ERROR:", repr(error))
                     S.chat_error = ("I couldn't transcribe that voice note (it needs the Gemini key). "
                                     "Please record it again or type your question.")
+                S.upload_nonce += 1
+                if not prompt:
                     st.rerun()
         with rest:
             with st.form("ask_form", clear_on_submit=True, border=False):
@@ -1996,199 +2295,57 @@ def chat_box():
 
 
 # ---------------------------------------------------------------------------
-# 13. Side panel: AI coach, personalisation, accessibility, hospitals, model check
+# 13. Settings: AI coach, personalisation, accessibility, model check
 # ---------------------------------------------------------------------------
 def coach_panel():
-    plan = build_agent_plan(S.profile, S.messages)
-    st.markdown(f"<div class='side-card'><span class='tag'>AI COACH</span>"
-                f"<p><b>{esc(plan['topic'].title())}</b><br>{esc(plan['summary'])}</p></div>",
-                unsafe_allow_html=True)
-    for k, s in enumerate(plan["suggestions"]):
-        if st.button(s["label"], key=f"coach_{k}", help=s["reason"], use_container_width=True):
-            if s["target"] == "quiz":
-                with st.spinner("Dr. Azmi is making your quiz..."):
-                    quiz_from_chat(plan["topic"])
-            elif s["target"] == "video":
-                open_video(AI_TOPIC_VIDEO.get(plan["topic"], "Immune System"))
-            else:
-                S.chat_note = "✍️ Type your follow-up question in the chat box."
-            st.rerun()
-    st.checkbox("Auto-start a quiz when I ask to practise", key="auto_start_box", value=S.auto_start_learning,
-                on_change=lambda: S.update(auto_start_learning=S.auto_start_box))
+    with st.expander("🧭 AI COACH"):
+        plan = build_agent_plan(S.profile, S.messages)
+        st.markdown(f"<div class='side-card'><span class='tag'>{esc(plan['topic'].upper())}</span>"
+                    f"<p>{esc(plan['summary'])}</p></div>", unsafe_allow_html=True)
+        for k, s in enumerate(plan["suggestions"]):
+            if st.button(s["label"], key=f"coach_{k}", help=s["reason"], use_container_width=True):
+                if s["target"] == "quiz":
+                    with st.spinner("Dr. Azmi is making your quiz..."):
+                        quiz_from_chat(plan["topic"])
+                elif s["target"] == "video":
+                    open_video(AI_TOPIC_VIDEO.get(plan["topic"], "Immune System"))
+                else:
+                    S.chat_note = "✍️ Type your follow-up question in the chat box."
+                st.rerun()
+        st.toggle("Auto-start a quiz when I ask to practise", key="auto_start_box", value=S.auto_start_learning,
+                  on_change=lambda: S.update(auto_start_learning=S.auto_start_box))
 
 
 def personalise_panel():
-    with st.expander("👤 Personalise Dr. Azmi"):
+    with st.expander("👤 PERSONALISE"):
         profile = S.profile
+        old_knowledge = profile.get("knowledge")
         for q in QUESTIONS:
             current = profile.get(q["key"], q["options"][0])
             profile[q["key"]] = st.selectbox(q["question"], q["options"], index=q["options"].index(current),
                                              key=f"profile_{q['key']}")
+        if profile.get("knowledge") != old_knowledge:  # AI quiz difficulty follows the knowledge level
+            S.ai_level = KNOWLEDGE_TO_LEVEL.get(profile["knowledge"], S.ai_level)
         if not any(m["role"] == "user" for m in S.messages):
             S.messages[0]["content"] = GREETINGS[profile["language"]]
 
 
+TEXT_SIZES = {"Small": 0.9, "Normal": 1.0, "Large": 1.15, "Extra large": 1.3}
+
+
 def accessibility_panel():
-    with st.expander("♿ Accessibility"):
-        scales = [0.9, 1.0, 1.15, 1.3]
-        names = ["Small", "Normal", "Large", "Extra large"]
-        i = min(range(len(scales)), key=lambda n: abs(scales[n] - S.font_scale))
-        st.write(f"Text size: **{names[i]}**")
-        a, b = st.columns(2)
-        a.button("A−", use_container_width=True, help="Smaller text",
-                 on_click=lambda: S.update(font_scale=scales[max(0, i - 1)]))
-        b.button("A+", use_container_width=True, help="Bigger text",
-                 on_click=lambda: S.update(font_scale=scales[min(len(scales) - 1, i + 1)]))
-        st.checkbox("Read Dr. Azmi's replies aloud", key="read_aloud_box", value=S.read_aloud,
-                    on_change=lambda: S.update(read_aloud=S.read_aloud_box))
+    with st.expander("👓 ACCESSIBILITY"):
+        current = min(TEXT_SIZES, key=lambda name: abs(TEXT_SIZES[name] - S.font_scale))
+        st.select_slider("Text size", options=list(TEXT_SIZES), value=current, key="text_size_box",
+                         on_change=lambda: S.update(font_scale=TEXT_SIZES[S.text_size_box]))
+        st.caption("Dr. Azmi's voice is switched on/off with the 🔊 toggle inside the chat box.")
         st.caption("Press Enter to send. Use Tab to move between controls.")
 
 
-HOSPITAL_HTML = """
-<div style="font-family:'Nunito',sans-serif;color:__INK__;">
-  <button id="find-hospitals" style="width:100%;padding:10px;border:3px solid __INK__;background:__CHIP__;color:__INK__;font-weight:800;cursor:pointer;box-shadow:3px 3px 0 __INK__;">
-    🏥 Find nearby hospitals
-  </button>
-  <p id="hospital-status" role="status" style="font-size:13px;margin:8px 0;color:__INK__;"></p>
-  <div id="hospital-results" style="display:none;"></div>
-  <p style="font-size:12px;color:__SUB__;margin:8px 0 0;">
-    Location is requested only after you click. AiJaga does not receive or save it.
-    OpenStreetMap receives your coordinates to find hospitals, and Google Maps receives them
-    to show the map or directions. Hospital data may be incomplete. Emergencies: call 999.
-  </p>
-</div>
-<script>
-(() => {
-const findButton = document.getElementById("find-hospitals");
-if (!findButton || findButton.dataset.ready) return;
-findButton.dataset.ready = "1";
-const status = document.getElementById("hospital-status");
-const results = document.getElementById("hospital-results");
-const distanceKm = (aLat, aLon, bLat, bLon) => {
-  const r = (d) => d * Math.PI / 180;
-  const dLat = r(bLat - aLat), dLon = r(bLon - aLon);
-  const v = Math.sin(dLat / 2) ** 2 + Math.cos(r(aLat)) * Math.cos(r(bLat)) * Math.sin(dLon / 2) ** 2;
-  return 6371 * 2 * Math.atan2(Math.sqrt(v), Math.sqrt(1 - v));
-};
-const renderHospitalResults = (hospitals, latitude, longitude) => {
-  const heading = document.createElement("h3");
-  heading.textContent = "Nearest hospitals";
-  heading.style.cssText = "font-size:15px;margin:12px 0 6px;color:__INK__;";
-  const note = document.createElement("p");
-  note.textContent = "Sorted by straight-line distance; actual travel distance and availability may differ.";
-  note.style.cssText = "font-size:12px;margin:0 0 8px;color:__SUB__;";
-  const list = document.createElement("div");
-  list.style.cssText = "display:grid;gap:8px;margin-bottom:12px;";
-  hospitals.slice(0, 5).forEach((hospital, index) => {
-    const result = document.createElement("a");
-    const directions = new URL("https://www.google.com/maps/dir/");
-    directions.searchParams.set("api", "1");
-    directions.searchParams.set("origin", `${latitude},${longitude}`);
-    directions.searchParams.set("destination", `${hospital.latitude},${hospital.longitude}`);
-    directions.searchParams.set("travelmode", "driving");
-    result.href = directions.toString();
-    result.target = "_blank";
-    result.rel = "noopener noreferrer";
-    result.style.cssText = "display:block;padding:10px;border:2px solid __INK__;color:__TEAL__;text-decoration:none;background:__CARD__;";
-    const name = document.createElement("strong");
-    name.textContent = `${index === 0 ? "Nearest: " : ""}${hospital.name}`;
-    const distance = document.createElement("span");
-    distance.textContent = ` · ${hospital.distance.toFixed(1)} km away`;
-    result.append(name, distance);
-    if (hospital.address) {
-      const address = document.createElement("div");
-      address.textContent = hospital.address;
-      address.style.cssText = "font-size:12px;margin-top:4px;color:__SUB__;";
-      result.append(address);
-    }
-    list.append(result);
-  });
-  const attribution = document.createElement("p");
-  attribution.textContent = "Hospital locations: OpenStreetMap contributors.";
-  attribution.style.cssText = "font-size:11px;color:__SUB__;margin:0 0 10px;";
-  results.append(heading, note, list, attribution);
-};
-findButton.addEventListener("click", () => {
-  results.style.display = "none";
-  results.replaceChildren();
-  if (!navigator.geolocation) {
-    status.textContent = "Location is not supported by this browser. Search for hospitals in your maps app.";
-    return;
-  }
-  findButton.disabled = true;
-  status.textContent = "Requesting your location permission…";
-  navigator.geolocation.getCurrentPosition(
-    async (position) => {
-      const { latitude, longitude } = position.coords;
-      const location = `${latitude},${longitude}`;
-      status.textContent = "Searching for nearby hospitals…";
-      const map = document.createElement("iframe");
-      map.title = "Nearby hospital search map";
-      map.src = `https://www.google.com/maps?q=hospitals+near+${location}&output=embed`;
-      map.loading = "lazy";
-      map.referrerPolicy = "no-referrer-when-downgrade";
-      map.allowFullscreen = true;
-      map.style.cssText = "width:100%;height:300px;border:3px solid __INK__;";
-      results.append(map);
-      results.style.display = "block";
-      try {
-        const query = `[out:json][timeout:20];(nwr["amenity"="hospital"](around:20000,${latitude},${longitude});nwr["healthcare"="hospital"](around:20000,${latitude},${longitude}););out center tags;`;
-        const response = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
-        if (!response.ok) throw new Error(`Hospital search returned HTTP ${response.status}`);
-        const data = await response.json();
-        const seen = new Set();
-        const hospitals = (data.elements || []).flatMap((element) => {
-          const key = `${element.type}/${element.id}`;
-          if (seen.has(key)) return [];
-          seen.add(key);
-          const hLat = element.lat ?? element.center?.lat;
-          const hLon = element.lon ?? element.center?.lon;
-          if (!Number.isFinite(hLat) || !Number.isFinite(hLon)) return [];
-          const tags = element.tags || {};
-          const name = tags.name || tags["name:en"] || tags["name:ms"];
-          if (!name) return [];
-          const address = [tags["addr:street"], tags["addr:city"] || tags["addr:town"]].filter(Boolean).join(", ");
-          return [{ name, address, latitude: hLat, longitude: hLon, distance: distanceKm(latitude, longitude, hLat, hLon) }];
-        }).sort((a, b) => a.distance - b.distance);
-        if (hospitals.length) {
-          renderHospitalResults(hospitals, latitude, longitude);
-          status.textContent = `Found ${hospitals.length} nearby hospitals. Showing the closest ${Math.min(hospitals.length, 5)}.`;
-        } else {
-          status.textContent = "No named hospitals were found within 20 km. The map is still available; try searching there.";
-        }
-      } catch (error) {
-        console.error("Nearby hospital search failed:", error);
-        status.textContent = "Could not load hospital names and distances. The map is still available; try again later.";
-      } finally {
-        findButton.disabled = false;
-      }
-    },
-    (error) => {
-      const messages = {
-        1: "Location permission was denied. Allow location access in your browser, or search in your maps app.",
-        2: "Your location could not be determined. Try again or search in your maps app.",
-        3: "The location request timed out. Try again or search in your maps app."
-      };
-      status.textContent = messages[error.code] || "Could not get your location. Search in your maps app.";
-      findButton.disabled = false;
-    },
-    { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 }
-  );
-});
-})();
-</script>
-"""
-
-
-def hospital_panel():
-    with st.expander("🏥 Nearby hospitals"):
-        st.html(themed(HOSPITAL_HTML), unsafe_allow_javascript=True)
-
-
 def model_check_panel():
-    with st.expander("⚙️ AI connection check"):
-        st.write(f"First choice: **{PRIMARY_PROVIDER.title()}** · Groq model `{GROQ_MODEL}` · "
-                 f"Gemini model(s) `{', '.join(MODELS)}`")
+    with st.expander("⚙ AI CONNECTION"):
+        st.write(f"First choice: **{PRIMARY_PROVIDER.title()}** · chat `{GROQ_MODEL}` · photos `{GROQ_VISION_MODEL}` · "
+                 f"Gemini `{', '.join(MODELS)}`")
         for name in ("GROQ_API_KEY", "GEMINI_API_KEY"):
             st.write(("✅ " if has_secret(name) else "❌ ") + f"`{name}` " +
                      ("found" if has_secret(name) else "missing in .streamlit/secrets.toml"))
@@ -2204,38 +2361,236 @@ def model_check_panel():
 
 
 # ---------------------------------------------------------------------------
-# 14. Pages
+# 14. Nearby hospitals (asks before using location, or uses a typed address)
+# ---------------------------------------------------------------------------
+HTTP_HEADERS = {"User-Agent": "AiJaga-health-education-app/1.0", "Accept": "application/json"}
+
+
+def _get_json(url, data=None):
+    request = Request(url, data=data, headers=HTTP_HEADERS)
+    with urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def distance_km(lat1, lon1, lat2, lon2):
+    r = math.radians
+    v = (math.sin(r(lat2 - lat1) / 2) ** 2
+         + math.cos(r(lat1)) * math.cos(r(lat2)) * math.sin(r(lon2 - lon1) / 2) ** 2)
+    return 6371 * 2 * math.atan2(math.sqrt(v), math.sqrt(1 - v))
+
+
+def drive_minutes(km):
+    """Rough estimate: roads are ~30% longer than a straight line, ~35 km/h in town."""
+    return max(2, round(km * 1.3 / 35 * 60))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode(address):
+    base = "https://nominatim.openstreetmap.org/search?"
+    for extra in ({"countrycodes": "my"}, {}):
+        found = _get_json(base + urlencode({"q": address, "format": "json", "limit": 1, **extra}))
+        if found:
+            return float(found[0]["lat"]), float(found[0]["lon"]), found[0].get("display_name", address)
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def hospitals_near(lat, lon):
+    for radius in (25000, 60000):
+        query = (f'[out:json][timeout:25];(nwr["amenity"="hospital"](around:{radius},{lat},{lon});'
+                 f'nwr["healthcare"="hospital"](around:{radius},{lat},{lon}););out center tags;')
+        data = _get_json("https://overpass-api.de/api/interpreter", urlencode({"data": query}).encode())
+        seen, found = set(), []
+        for element in data.get("elements", []):
+            key = f"{element['type']}/{element['id']}"
+            h_lat = element.get("lat", element.get("center", {}).get("lat"))
+            h_lon = element.get("lon", element.get("center", {}).get("lon"))
+            tags = element.get("tags", {})
+            name = tags.get("name") or tags.get("name:en") or tags.get("name:ms")
+            if key in seen or h_lat is None or not name:
+                continue
+            seen.add(key)
+            address = ", ".join(x for x in (tags.get("addr:street"), tags.get("addr:city") or tags.get("addr:town")) if x)
+            found.append({"name": name, "address": address, "lat": h_lat, "lon": h_lon,
+                          "km": distance_km(lat, lon, h_lat, h_lon)})
+        if found:
+            return sorted(found, key=lambda h: h["km"])
+    return []
+
+
+def hospital_card(rank, h, origin):
+    directions = "https://www.google.com/maps/dir/?" + urlencode(
+        {"api": 1, "origin": origin, "destination": f"{h['lat']},{h['lon']}", "travelmode": "driving"})
+    address = f"<div class='hosp-addr'>{esc(h['address'])}</div>" if h["address"] else "<div class='hosp-addr'></div>"
+    return (f"<div class='hosp-card'><div class='hosp-rank'>{rank}</div><div>"
+            f"<div class='hosp-name'>{esc(h['name'])}</div>{address}"
+            f"<div class='hosp-dist'>📍 about {h['km']:.1f} km away · 🚗 about {drive_minutes(h['km'])} min by car (estimate)</div>"
+            f"<a href='{esc(directions)}' target='_blank' rel='noopener noreferrer'>GET DIRECTIONS ↗</a></div></div>")
+
+
+GPS_HTML = """
+<div id="gps-box">
+  <p id="gps-status" class="hosp-status" role="status">Asking your browser for your location… please press <b>Allow</b>.</p>
+  <div id="gps-results"></div>
+</div>
+<script>
+(() => {
+  const status = document.getElementById("gps-status");
+  const box = document.getElementById("gps-results");
+  if (!status || box.dataset.ready === "__NONCE__") return;
+  box.dataset.ready = "__NONCE__";
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const km = (aLat, aLon, bLat, bLon) => {
+    const r = (d) => d * Math.PI / 180, dLat = r(bLat - aLat), dLon = r(bLon - aLon);
+    const v = Math.sin(dLat / 2) ** 2 + Math.cos(r(aLat)) * Math.cos(r(bLat)) * Math.sin(dLon / 2) ** 2;
+    return 6371 * 2 * Math.atan2(Math.sqrt(v), Math.sqrt(1 - v));
+  };
+  const card = (rank, h, lat, lon) => {
+    const url = new URL("https://www.google.com/maps/dir/");
+    url.searchParams.set("api", "1"); url.searchParams.set("origin", `${lat},${lon}`);
+    url.searchParams.set("destination", `${h.lat},${h.lon}`); url.searchParams.set("travelmode", "driving");
+    const mins = Math.max(2, Math.round(h.km * 1.3 / 35 * 60));
+    return `<div class="hosp-card"><div class="hosp-rank">${rank}</div><div>
+      <div class="hosp-name">${esc(h.name)}</div><div class="hosp-addr">${esc(h.address)}</div>
+      <div class="hosp-dist">📍 about ${h.km.toFixed(1)} km away · 🚗 about ${mins} min by car (estimate)</div>
+      <a href="${url}" target="_blank" rel="noopener noreferrer">GET DIRECTIONS ↗</a></div></div>`;
+  };
+  if (!navigator.geolocation) {
+    status.textContent = "Your browser can't share location. Press 'NO, TYPE MY ADDRESS' instead.";
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(async (pos) => {
+    const lat = pos.coords.latitude, lon = pos.coords.longitude;
+    status.textContent = "Searching for hospitals near you…";
+    try {
+      let list = [];
+      for (const radius of [25000, 60000]) {
+        const q = `[out:json][timeout:25];(nwr["amenity"="hospital"](around:${radius},${lat},${lon});nwr["healthcare"="hospital"](around:${radius},${lat},${lon}););out center tags;`;
+        const res = await fetch("https://overpass-api.de/api/interpreter?data=" + encodeURIComponent(q));
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        const seen = new Set();
+        list = (data.elements || []).flatMap((e) => {
+          const key = e.type + "/" + e.id; if (seen.has(key)) return []; seen.add(key);
+          const hLat = e.lat ?? e.center?.lat, hLon = e.lon ?? e.center?.lon, t = e.tags || {};
+          const name = t.name || t["name:en"] || t["name:ms"];
+          if (!name || !Number.isFinite(hLat)) return [];
+          const address = [t["addr:street"], t["addr:city"] || t["addr:town"]].filter(Boolean).join(", ");
+          return [{ name, address, lat: hLat, lon: hLon, km: km(lat, lon, hLat, hLon) }];
+        }).sort((a, b) => a.km - b.km);
+        if (list.length) break;
+      }
+      if (!list.length) { status.textContent = "No named hospitals found nearby. Try typing your address instead."; return; }
+      status.textContent = "The 2 nearest hospitals to you:";
+      box.innerHTML = list.slice(0, 2).map((h, i) => card(i + 1, h, lat, lon)).join("") +
+        `<iframe class="hosp-map" title="Map of nearby hospitals" loading="lazy"
+           src="https://www.google.com/maps?q=hospitals+near+${lat},${lon}&output=embed"></iframe>
+         <p style="font-size:12px;opacity:.8">Hospital data: OpenStreetMap contributors. Distances are estimates.</p>`;
+    } catch (err) {
+      console.error(err);
+      status.textContent = "Couldn't load hospitals right now. Try again, or type your address instead.";
+    }
+  }, (err) => {
+    const why = {1: "You didn't allow location sharing.", 2: "Your location couldn't be found.", 3: "The location request timed out."};
+    status.textContent = (why[err.code] || "Couldn't get your location.") + " Press 'NO, TYPE MY ADDRESS' to search by address.";
+  }, { enableHighAccuracy: false, timeout: 15000, maximumAge: 60000 });
+})();
+</script>
+"""
+
+
+def hospitals_page():
+    top_bar()
+    page_heading("✚ NEARBY HOSPITALS", "FIND THE 2 CLOSEST HOSPITALS")
+    _, mid, _ = st.columns([0.15, 1, 0.15])
+    with mid:
+        notice("In an emergency, call 999 (or 112 from a mobile) right away. Don't wait for a search.", "bad")
+        st.markdown("<div class='card'><span class='tag'>STEP 1</span>"
+                    "<p style='font-size:19px;font-weight:800;margin:12px 0 4px'>"
+                    "Do you want to share your location so Dr. Azmi can find hospitals near you?</p>"
+                    "<p class='sub' style='margin:0'>Your location is only used in your browser to search "
+                    "OpenStreetMap. AiJaga does not save it.</p></div>", unsafe_allow_html=True)
+        yes, no = st.columns(2)
+        if yes.button("YES, USE MY LOCATION", type="primary", use_container_width=True):
+            S.update(hosp_mode="gps", hosp_nonce=S.hosp_nonce + 1, hosp_result=None, hosp_error=None)
+        if no.button("NO, TYPE MY ADDRESS", use_container_width=True):
+            S.update(hosp_mode="address", hosp_error=None)
+
+        if S.hosp_mode == "gps":
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+            st.html(GPS_HTML.replace("__NONCE__", str(S.hosp_nonce)), unsafe_allow_javascript=True)
+
+        elif S.hosp_mode == "address":
+            st.markdown("<div class='card' style='margin-top:14px'><span class='tag'>STEP 2</span>"
+                        "<p style='font-size:18px;font-weight:800;margin:12px 0 0'>Enter your current address</p></div>",
+                        unsafe_allow_html=True)
+            with st.form("address_form", border=False):
+                address = st.text_input("Your current address", label_visibility="collapsed",
+                                        placeholder="e.g. Jalan Universiti, Skudai, Johor")
+                if st.form_submit_button("SEARCH HOSPITALS ▸", use_container_width=True) and address.strip():
+                    try:
+                        with st.spinner("Finding your address and nearby hospitals..."):
+                            place = geocode(address.strip())
+                            if not place:
+                                S.update(hosp_result=None, hosp_error="I couldn't find that address. "
+                                         "Try adding the town and state, e.g. 'Taman Universiti, Skudai, Johor'.")
+                            else:
+                                lat, lon, label = place
+                                S.update(hosp_error=None, hosp_result={"label": label, "lat": lat, "lon": lon,
+                                                                       "list": hospitals_near(lat, lon)[:2]})
+                    except Exception as error:
+                        print("HOSPITAL SEARCH ERROR:", repr(error))
+                        S.update(hosp_result=None, hosp_error="The map service didn't answer. Please try again in a minute.")
+            if S.hosp_error:
+                notice(S.hosp_error, "bad")
+            result = S.hosp_result
+            if result:
+                st.caption(f"Searching from: {result['label']}")
+                if not result["list"]:
+                    notice("No named hospitals were found within 60 km of that address.", "bad")
+                else:
+                    origin = f"{result['lat']},{result['lon']}"
+                    st.markdown("".join(hospital_card(i + 1, h, origin) for i, h in enumerate(result["list"])),
+                                unsafe_allow_html=True)
+                    st.markdown(f"<iframe class='hosp-map' title='Map of nearby hospitals' loading='lazy' "
+                                f"src='https://www.google.com/maps?q=hospitals+near+{origin}&output=embed'></iframe>",
+                                unsafe_allow_html=True)
+                    st.caption("Hospital data: OpenStreetMap contributors. Distances are straight-line estimates; "
+                               "real travel time depends on roads and traffic.")
+    tv_footer()
+
+
+# ---------------------------------------------------------------------------
+# 15. Pages
 # ---------------------------------------------------------------------------
 def home_page():
     top_bar()
-    main, side = st.columns([2.3, 1], gap="large")
+    st.markdown(f"<div class='hero'>{mascot(88)}<span class='tag'>DR. AZMI</span>"
+                f"<h1>HI, I'M DR. AZMI</h1><p>Ask me about your health — I'm here to help.</p></div>",
+                unsafe_allow_html=True)
+    _, mid, _ = st.columns([0.06, 1, 0.06])
+    with mid:
+        chat_started = any(m["role"] == "user" for m in S.messages)
+        with st.container(key="chat_zone_open" if chat_started else "chat_zone_closed"):
+            chat_box()
 
-    with main:
-        st.markdown(
-            "<div style='display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:34px;margin:18px 0 26px'>"
-            f"<div style='text-align:center'>{DOCTOR_SVG.format(w=88, h=110)}<br><span class='tag'>DR. AZMI</span></div>"
-            "<div class='bubble-hello'>"
-            "<div class='pixel sub' style='font-size:12px'>DR. AZMI</div>"
-            "<p style='font-size:20px;font-weight:700;margin:6px 0 8px'>Hi, I am Dr. Azmi!</p>"
-            "<p style='font-size:16px;margin:0 0 10px'>Ask me a health question below, or press "
-            "<b>Video</b> or <b>Quiz</b> to learn and play.</p>"
-            "<div class='dots' aria-hidden='true'><span></span><span></span><span></span></div>"
-            "</div></div>", unsafe_allow_html=True)
-        chat_box()
+        st.markdown("<div class='tools-label'>OTHER TOOLS</div>", unsafe_allow_html=True)
+        a, b, c = st.columns(3)
+        a.button("▶  VIDEO", key="tool_video", on_click=go, args=("video_fields",), use_container_width=True)
+        b.button("( ? )  QUIZ", key="tool_quiz", on_click=go, args=("quiz_fields",), use_container_width=True)
+        c.button("✚  NEARBY HOSPITALS", key="tool_hosp", on_click=go, args=("hospitals",), use_container_width=True)
 
-    with side:
-        st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-        st.button("VIDEO", key="open_video", on_click=go, args=("video_fields",), use_container_width=True,
-                  help="Watch short health and first-aid videos")
-        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-        st.button("QUIZ", key="open_quiz", on_click=go, args=("quiz_fields",), use_container_width=True,
-                  help="Test your health knowledge")
-        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-        coach_panel()
-        personalise_panel()
-        accessibility_panel()
-        hospital_panel()
-        model_check_panel()
+        st.markdown("<div class='tools-label'>SETTINGS</div>", unsafe_allow_html=True)
+        with st.container(key="settings_row"):
+            cols = st.columns(4)
+            with cols[0]:
+                coach_panel()
+            with cols[1]:
+                personalise_panel()
+            with cols[2]:
+                accessibility_panel()
+            with cols[3]:
+                model_check_panel()
     tv_footer()
 
 
@@ -2248,26 +2603,48 @@ def tile_grid(n, per_row=3):
         yield i, cols[i % per_row]
 
 
+def progress_html(pct, done=False):
+    label = f"✓ {pct}% DONE" if done else f"{pct}% DONE"
+    return f"<div class='mini'><i style='width:{pct}%'></i></div><span class='pct'>{label}</span>"
+
+
+def difficulty_slider():
+    st.select_slider("AI quiz difficulty", options=AI_LEVELS, value=S.ai_level, key="ai_level_box",
+                     on_change=lambda: S.update(ai_level=S.ai_level_box))
+
+
 # ---- QUIZ ----------------------------------------------------------------
 def quiz_fields_page():
     top_bar()
-    page_heading("( ? ) PICK A FIELD", "WHAT DO YOU WANT TO BE QUIZZED ON?")
-    _, mid, _ = st.columns([1, 1.4, 1])
-    if mid.button("✨ MAKE A QUIZ FROM MY CHAT", type="primary", use_container_width=True,
-                  help="Dr. Azmi writes questions from his latest explanation"):
-        with st.spinner("Dr. Azmi is making your quiz..."):
-            quiz_from_chat(build_agent_plan(S.profile, S.messages)["topic"])
-        st.rerun()
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    page_heading("( ? ) HEALTH QUIZ", "PICK A FIELD — OR LET DR. AZMI WRITE ONE")
+    with st.container(key="ai_maker"):
+        st.markdown("<div class='maker-title'>✨ AI QUIZ · 5 NEW QUESTIONS</div>", unsafe_allow_html=True)
+        left, right = st.columns([1, 1.3], gap="large")
+        with left:
+            difficulty_slider()
+            if st.button("FROM MY CHAT ▸", key="ai_from_chat", type="primary", use_container_width=True,
+                         help="Questions based on Dr. Azmi's latest explanation"):
+                with st.spinner("Dr. Azmi is writing your quiz..."):
+                    quiz_from_chat(build_agent_plan(S.profile, S.messages)["topic"])
+                st.rerun()
+        with right:
+            with st.form("ai_topic_form", border=False):
+                topic = st.text_input("Any health topic", placeholder="e.g. dengue, healthy breakfast, CPR")
+                if st.form_submit_button("MAKE AI QUIZ ▸", use_container_width=True) and topic.strip():
+                    with st.spinner(f"Dr. Azmi is writing a {S.ai_level} quiz about {topic.strip()}..."):
+                        quiz_from_topic(topic.strip())
+                    st.rerun()
+
     for fi, col in tile_grid(len(FIELDS)):
         f = FIELDS[fi]
-        statuses = [get_status(fi, qi)["kind"] for qi in range(len(f["quizzes"]))]
-        done, part = statuses.count("done"), statuses.count("part")
-        all_done = done == len(f["quizzes"])
-        count = f"{done}/{len(f['quizzes'])} done" + (f" · {part} in progress" if part else "")
+        pct = field_percent(fi)
+        done = sum(get_status(fi, qi)["kind"] == "done" for qi in range(len(f["quizzes"])))
+        all_done = pct == 100
         with col, st.container(key=f"{'tiledone' if all_done else 'tile'}_qf{fi}"):
-            st.markdown(f"<p class='tile-title'>{esc(f['name'].upper())}</p>"
-                        f"<span class='tile-count'>{count}</span>", unsafe_allow_html=True)
+            st.markdown(f"<div class='tile-icon'>{FIELD_ICONS[fi % len(FIELD_ICONS)]}</div>"
+                        f"<p class='tile-title'>{esc(f['name'].upper())}</p>"
+                        f"<span class='tile-count'>{done} of {len(f['quizzes'])} topics finished</span>"
+                        f"{progress_html(pct, all_done)}", unsafe_allow_html=True)
             st.button("OPEN ▸", key=f"qf_{fi}", use_container_width=True,
                       on_click=lambda fi=fi: S.update(q_field=fi, page="quiz_topics"))
     tv_footer()
@@ -2277,26 +2654,34 @@ def quiz_topics_page():
     fi = S.q_field
     f = FIELDS[fi]
     top_bar()
-    page_heading(f["name"].upper(), "PICK A TOPIC")
+    st.button("◂ ALL FIELDS", key="back_fields", on_click=go, args=("quiz_fields",))
+    page_heading(f"{FIELD_ICONS[fi % len(FIELD_ICONS)]} {f['name'].upper()}", "PICK A TOPIC")
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        difficulty_slider()
+        st.caption("Used by the ✨ AI buttons (5 brand-new questions).")
     for qi, col in tile_grid(len(f["quizzes"])):
         z = f["quizzes"][qi]
         s = get_status(fi, qi)
         if s["kind"] == "done":
-            body = f"<span class='tile-count'>✓ DONE · {s['score']}/{s['total']}</span>"
+            info = f"<span class='tile-count'>Score {s['score']}/{s['total']}</span>"
             label, kind = "PLAY AGAIN", "secondary"
         elif s["kind"] == "part":
-            body = (f"<div class='mini'><i style='width:{s['pct']}%'></i></div>"
-                    f"<span class='tile-count'>{s['pct']}% done · {s['left']} left</span>")
+            info = f"<span class='tile-count'>{s['left']} question(s) left</span>"
             label, kind = "CONTINUE ▸", "primary"
         else:
-            body = f"<span class='tile-count'>{s['total']} questions</span>"
+            info = f"<span class='tile-count'>{s['total']} questions</span>"
             label, kind = "START ▸", "secondary"
         with col, st.container(key=f"{'tiledone' if s['kind'] == 'done' else 'tile'}_qt{fi}_{qi}"):
-            st.markdown(f"<p class='tile-title'>{esc(z['title'].upper())}</p>{body}", unsafe_allow_html=True)
-            st.button(label, key=f"qt_{fi}_{qi}", type=kind, use_container_width=True,
-                      on_click=start_quiz, args=(fi, qi))
-    _, mid, _ = st.columns([1, 1, 1])
-    mid.button("◂ BACK TO FIELDS", use_container_width=True, on_click=go, args=("quiz_fields",))
+            st.markdown(f"<p class='tile-title'>{esc(z['title'].upper())}</p>{info}"
+                        f"{progress_html(s['pct'], s['kind'] == 'done')}", unsafe_allow_html=True)
+            a, b = st.columns([1.3, 1])
+            a.button(label, key=f"qt_{fi}_{qi}", type=kind, use_container_width=True, on_click=start_quiz, args=(fi, qi))
+            if b.button("✨ AI", key=f"aiq_{fi}_{qi}", use_container_width=True,
+                        help=f"5 new {S.ai_level} AI questions about {z['title']}"):
+                with st.spinner(f"Dr. Azmi is writing a {S.ai_level} quiz about {z['title']}..."):
+                    quiz_from_topic(z["title"])
+                st.rerun()
     tv_footer()
 
 
@@ -2308,81 +2693,99 @@ def quiz_play_page():
     i, pick = S.q_i, S.q_pick
     answered = pick is not None
     item = S.q_items[i]
+    is_ai = S.q_source == "ai"
 
-    top_bar((f"SCORE {S.q_score} / {total} · QUESTION {i + 1} OF {total}",
-             (i + (1 if answered else 0)) / total * 100))
-    page_heading(("✨ " if S.q_source == "ai" else "( ? ) ") + S.q_title.upper())
-    _, mid, _ = st.columns([0.6, 2, 0.6])
+    top_bar()
+    _, mid, _ = st.columns([0.35, 2, 0.35])
     with mid:
+        # navigation lives up here, away from the NEXT button
+        if is_ai:
+            st.button("◂ BACK TO QUIZZES", key="back_quiz_ai", on_click=go, args=("quiz_fields",))
+        else:
+            st.button("◂ TOPICS (progress is saved)", key="back_topics", on_click=go, args=("quiz_topics",))
+
+        dots = []
+        for n in range(total):
+            result = S.q_results[n] if n < len(S.q_results) else None
+            cls = "now" if n == i and not answered else "ok" if result else "bad" if result is False else ""
+            if n < i and result is None:
+                cls = "past"  # answered in an earlier visit
+            dots.append(f"<span class='qdot {cls}'>{n + 1}</span>")
+        source = "✨ AI QUIZ" if is_ai else FIELDS[S.q_field]["name"].upper()
+        difficulty = S.ai_level if is_ai else library_tier(1 + S.xp // 10)
+        st.markdown(f"<div class='quiz-head'><div><span class='tag'>{esc(source)}</span> "
+                    f"<span class='pill'>{esc(difficulty.upper())}</span>"
+                    f"<div class='qt' style='margin-top:8px'>{esc(S.q_title.upper())}</div>"
+                    f"<div class='qdots'>{''.join(dots)}</div></div>"
+                    f"<div class='score-chip'>SCORE {S.q_score}/{total}</div></div>", unsafe_allow_html=True)
         if S.quiz_notice:
-            st.info(S.quiz_notice)
+            notice(S.quiz_notice)
             if answered:
                 S.quiz_notice = None
-        st.markdown(f"<div class='card' style='margin-top:10px'><span class='tag'>QUESTION {i + 1} OF {total}</span>"
-                    f"<p style='font-size:calc(22px * {S.font_scale});font-weight:800;line-height:1.35;margin:14px 0 0'>"
-                    f"{esc(item['q'])}</p></div>", unsafe_allow_html=True)
+
+        st.markdown(f"<div class='qcard'><span class='tag qnum'>QUESTION {i + 1} OF {total}</span>"
+                    f"<p class='qtext'>{esc(item['q'])}</p></div>", unsafe_allow_html=True)
         for k, option in enumerate(item["opts"]):
-            prefix, label = "opt", option
+            letter = "ABCDEF"[k]
+            prefix, label = "opt", f"{letter}.  {option}"
             if answered:
                 if option == item["answer"]:
-                    prefix, label = "optok", "✓ " + option
+                    prefix, label = "optok", f"✓  {option}"
                 elif k == pick:
-                    prefix, label = "optbad", "✕ " + option
+                    prefix, label = "optbad", f"✕  {option}"
                 else:
                     prefix = "optdim"
             st.button(label, key=f"{prefix}_{i}_{k}", on_click=choose_answer, args=(k,), use_container_width=True)
 
         if answered:
-            explain = (" " + item["explain"]) if item.get("explain") else ""
-            if item["opts"][pick] == item["answer"]:
-                st.success("★ CORRECT! +1 XP" + explain)
+            correct = item["opts"][pick] == item["answer"]
+            explain = f"<span>{esc(item['explain'])}</span>" if item.get("explain") else ""
+            if correct:
+                st.markdown(f"<div class='feedback ok'><b class='head'>★ CORRECT! +1 XP</b>{explain}</div>",
+                            unsafe_allow_html=True)
                 if S.play_ding and CORRECT_ANSWER_SOUND.exists():
                     with st.container(key="ding"):
                         st.audio(CORRECT_ANSWER_SOUND.read_bytes(), format="audio/mp3", autoplay=True)
                 S.play_ding = False
             else:
-                st.error(f"✕ NOT QUITE — the correct answer is: {item['answer']}." + explain)
-            last = i == total - 1
-            a, b = st.columns(2)
-            a.button("SEE SCORE ▸" if last else "NEXT ▸", type="primary", use_container_width=True,
-                     on_click=next_question)
-            if S.q_source == "library":
-                b.button("◂ TOPICS", use_container_width=True, on_click=go, args=("quiz_topics",))
-            else:
-                b.button("◂ BACK TO CHAT", use_container_width=True, on_click=go, args=("home",))
-        elif S.q_source == "library":
-            st.button("◂ TOPICS (progress is saved)", on_click=go, args=("quiz_topics",))
+                st.markdown(f"<div class='feedback bad'><b class='head'>✕ NOT QUITE</b>"
+                            f"<span>The correct answer is: <b>{esc(item['answer'])}</b>.</span><br>{explain}</div>",
+                            unsafe_allow_html=True)
+            st.button("SEE MY SCORE ▸" if i == total - 1 else "NEXT QUESTION ▸", type="primary",
+                      use_container_width=True, on_click=next_question)
     tv_footer()
 
 
 def quiz_result_page():
     total, s = len(S.q_items), S.q_score
+    pct = round(s / total * 100) if total else 0
     if s == total:
-        msg, mood, win = "Congrats, you nailed it!", "happy", True
-    elif s == total - 1:
-        msg, mood, win = "So close!", "ok", False
+        msg, win = "Congrats, you nailed it!", True
+    elif s >= total - 1:
+        msg, win = "So close! Great work.", False
     else:
-        msg, mood, win = "It's okay, you can try again.", "flat", False
-    celebrate = s >= total - 1
+        msg, win = "It's okay — try again and level up.", False
+    is_ai = S.q_source == "ai"
 
-    top_bar((f"SCORE {s} / {total} · COMPLETE", 100))
+    top_bar()
     _, mid, _ = st.columns([0.6, 2, 0.6])
     with mid:
-        st.markdown(f"<div class='card result'><span class='tag'>LEVEL COMPLETE!</span><br><br>"
-                    f"<div class='{'hop' if celebrate else ''}'>{mood_doctor(mood, 10)}</div>"
-                    f"<p class='result-score'>YOU GOT {s} / {total}</p>"
+        st.markdown(f"<div class='card result'><span class='tag'>QUIZ COMPLETE</span><br><br>"
+                    f"<div class='{'hop' if S.celebrate or win else ''}'>{mascot(110)}</div>"
+                    f"<p class='result-score'>{s} / {total}</p>"
+                    f"<p class='result-pct'>{pct}% CORRECT · {esc((S.ai_level if is_ai else 'LIBRARY').upper())}</p>"
                     f"<p class='result-msg {'win' if win else ''}'>{esc(msg)}</p>"
-                    f"<p class='sub' style='font-weight:700'>{esc(level_info()[0])}</p></div>",
+                    f"<p class='sub' style='font-weight:800'>{esc(level_info()[0])}</p></div>",
                     unsafe_allow_html=True)
         a, b, c = st.columns(3)
-        if S.q_source == "library":
+        if is_ai:
+            a.button("TRY AGAIN", type="primary", use_container_width=True, on_click=start_ai_quiz)
+        else:
             a.button("TRY AGAIN", type="primary", use_container_width=True,
                      on_click=start_quiz, args=(S.q_field, S.q_topic))
-        else:
-            a.button("TRY AGAIN", type="primary", use_container_width=True, on_click=start_ai_quiz)
-        b.button("TRY OTHER QUIZ", use_container_width=True, on_click=go, args=("quiz_fields",))
+        b.button("OTHER QUIZZES", use_container_width=True, on_click=go, args=("quiz_fields",))
         c.button("ASK DR. AZMI", use_container_width=True, on_click=go, args=("home",))
-    if S.celebrate:
+    if S.celebrate:  # AI quiz with 2+ correct answers
         S.celebrate = False
         run_js(CONFETTI_JS)
     tv_footer()
@@ -2402,11 +2805,10 @@ def video_fields_page():
         vids = videos_in_field(fi)
         watched = sum(v["id"] in S.video_seen for v in vids)
         pct = round(watched / len(vids) * 100) if vids else 0
-        with col, st.container(key=f"tile_vf{fi}"):
+        with col, st.container(key=f"{'tiledone' if pct == 100 else 'tile'}_vf{fi}"):
             st.markdown(f"<p class='tile-title'>{esc(VIDEO_FIELDS[fi].upper())}</p>"
-                        f"<div class='mini'><i style='width:{pct}%'></i></div>"
-                        f"<span class='tile-count'>{len(vids)} videos · {watched} watched</span>",
-                        unsafe_allow_html=True)
+                        f"<span class='tile-count'>{len(vids)} videos · {watched} watched</span>"
+                        f"<div class='mini'><i style='width:{pct}%'></i></div>", unsafe_allow_html=True)
             st.button("OPEN ▸", key=f"vf_{fi}", use_container_width=True,
                       on_click=lambda fi=fi: S.update(v_field=fi, page="video_list"))
     _, mid, _ = st.columns([1, 1.2, 1])
@@ -2418,6 +2820,7 @@ def video_list_page():
     fi = S.v_field
     vids = videos_in_field(fi)
     top_bar()
+    st.button("◂ ALL FIELDS", key="back_vfields", on_click=go, args=("video_fields",))
     page_heading(VIDEO_FIELDS[fi].upper(), "PICK A VIDEO")
     for i, col in tile_grid(len(vids)):
         v = vids[i]
@@ -2426,8 +2829,6 @@ def video_list_page():
                         unsafe_allow_html=True)
             st.button("▶ WATCH", key=f"vl_{fi}_{i}", type="primary", use_container_width=True,
                       on_click=lambda i=i: S.update(v_i=i, page="video_watch"))
-    _, mid, _ = st.columns([1, 1, 1])
-    mid.button("◂ BACK TO FIELDS", use_container_width=True, on_click=go, args=("video_fields",))
     tv_footer()
 
 
@@ -2446,6 +2847,7 @@ def video_watch_page():
         S.v_i = k % n
 
     top_bar()
+    st.button("◂ VIDEOS", key="back_videos", on_click=go, args=("video_list",))
     player, playlist = st.columns([2.2, 1], gap="large")
 
     with player:
@@ -2461,15 +2863,14 @@ def video_watch_page():
                     unsafe_allow_html=True)
         st.caption("YouTube videos have not been medically reviewed by AiJaga. Check important health advice "
                    "with a trusted adult or health professional.")
-        a, b, c, d = st.columns(4)
-        b.button("◂ PREV", use_container_width=True, on_click=select, args=(S.v_i - 1,))
-        c.button("NEXT ▸", use_container_width=True, on_click=select, args=(S.v_i + 1,))
+        a, b, c = st.columns(3)
+        a.button("◂ PREV", use_container_width=True, on_click=select, args=(S.v_i - 1,))
+        b.button("NEXT ▸", use_container_width=True, on_click=select, args=(S.v_i + 1,))
         if quiz:
-            a.button("TAKE THE QUIZ", type="primary", use_container_width=True, on_click=start_quiz, args=quiz)
+            c.button("TAKE THE QUIZ", type="primary", use_container_width=True, on_click=start_quiz, args=quiz)
         else:
-            a.button("ASK DR. AZMI", type="primary", use_container_width=True,
+            c.button("ASK DR. AZMI", type="primary", use_container_width=True,
                      on_click=ask_about, args=(f"Teach me about {v['title'].lower()}",))
-        d.button("◂ VIDEOS", use_container_width=True, on_click=go, args=("video_list",))
         if quiz:
             st.button(f"💬 Ask Dr. Azmi about {v['title']}", key="ask_video",
                       on_click=ask_about, args=(f"Teach me about {v['title'].lower()}",))
@@ -2495,9 +2896,9 @@ TODO_HTML = """
       ADD
     </button>
   </div>
-  <p id="todo-status" role="status" aria-live="polite" style="color:__BAD__;"></p>
+  <p id="todo-status" role="status" aria-live="polite" style="color:__BAD_TEXT__;"></p>
   <div id="todo-list"></div>
-  <p style="font-size:12px;color:__SUB__;margin-top:18px;">
+  <p style="font-size:12px;color:__MUTED__;margin-top:18px;">
     Suggestions are for health learning only, not medical care or treatment advice.
   </p>
 </div>
@@ -2547,7 +2948,7 @@ TODO_HTML = """
       if (todo.done) { text.style.textDecoration = "line-through"; text.style.opacity = ".6"; }
       const source = document.createElement("small");
       source.textContent = todo.source || "";
-      source.style.cssText = "color:__SUB__;";
+      source.style.cssText = "color:__MUTED__;";
       const remove = document.createElement("button");
       remove.type = "button";
       remove.textContent = "Remove";
@@ -2591,7 +2992,7 @@ def todo_page():
 
 
 # ---------------------------------------------------------------------------
-# 15. Show the right page
+# 16. Show the right page
 # ---------------------------------------------------------------------------
 PAGES = {
     "home": home_page,
@@ -2602,6 +3003,7 @@ PAGES = {
     "video_fields": video_fields_page,
     "video_list": video_list_page,
     "video_watch": video_watch_page,
+    "hospitals": hospitals_page,
 }
 
 inject_css()
