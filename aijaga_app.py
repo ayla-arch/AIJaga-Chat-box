@@ -2857,10 +2857,9 @@ def model_check_panel():
     with st.expander("⚙ AI CONNECTION"):
         st.write(f"First choice: **{PRIMARY_PROVIDER.title()}** · chat `{GROQ_MODEL}` · photos `{GROQ_VISION_MODEL}` · "
                  f"Gemini `{', '.join(MODELS)}`")
-        for name in ("GROQ_API_KEY", "GEMINI_API_KEY", "GOOGLE_MAPS_API_KEY", "YOUTUBE_API_KEY"):
+        for name in ("GROQ_API_KEY", "GEMINI_API_KEY", "YOUTUBE_API_KEY"):
             st.write(("✅ " if has_secret(name) else "❌ ") + f"`{name}` " +
                      ("found" if has_secret(name) else "missing in .streamlit/secrets.toml")
-                     + (" — double-checks clinics are really open (Places API New)" if name == "GOOGLE_MAPS_API_KEY" else "")
                      + (" — lets the video agent also search YouTube (optional)" if name == "YOUTUBE_API_KEY" else ""))
         if st.button("List models my keys can use", key="list_models", use_container_width=True):
             with st.spinner("Asking Gemini and Groq..."):
@@ -2999,7 +2998,7 @@ VERDICT_RANK = {"verified_open": 0, "open_unverified": 1, "not_checked": 2, "unk
 
 def google_key():
     try:
-        return str(st.secrets["GOOGLE_MAPS_API_KEY"]).strip()
+        return ""
     except Exception:
         return ""
 
@@ -3016,7 +3015,7 @@ def google_check(place):
     as proof it's active, and recent reviews that mention closing/moving raise a warning."""
     key = google_key()
     if not key:
-        return {"verdict": "not_checked", "note": "Not double-checked on Google (no GOOGLE_MAPS_API_KEY)."}
+        return {"verdict": "not_checked", "note": "Not double-checked on Google — call ahead to be safe."}
     body = {"textQuery": place["name"], "languageCode": "en", "regionCode": "MY",
             "locationBias": {"circle": {"center": {"latitude": place["lat"], "longitude": place["lon"]}, "radius": 500.0}}}
     try:
@@ -3487,7 +3486,7 @@ def hospitals_page():
                 st.caption(f"Planner: {result['agent']} · checked at {result['time']} (Malaysia time)")
             st.caption(("Opening status double-checked with Google Maps (business status, opening hours and recent "
                         "reviews). " if result["google"] else
-                        "Add GOOGLE_MAPS_API_KEY to secrets.toml to double-check opening status with Google Maps. ")
+                        "")
                        + "Places from OpenStreetMap contributors. Distances and times are estimates — "
                          "call ahead if you can.")
     tv_footer()
