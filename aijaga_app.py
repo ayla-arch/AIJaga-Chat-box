@@ -5281,6 +5281,39 @@ def tour_button(key):
 
 
 # ---------------------------------------------------------------------------
+# DEMO watermark (competition rule: the web app must show a clear "DEMO" watermark)
+# It is added straight to the page body, so it stays on top of every page, the
+# guided tour and the to-do pop-up, and it never blocks clicks.
+# ---------------------------------------------------------------------------
+WATERMARK_HTML = """
+<script>
+(() => {
+  if (document.getElementById("aj-watermark")) return;
+  const css = document.createElement("style");
+  css.textContent = `
+    #aj-watermark{position:fixed;inset:0;z-index:2147483647;pointer-events:none;display:flex;
+      align-items:center;justify-content:center;overflow:hidden}
+    #aj-watermark b{font-family:'Silkscreen',monospace;font-size:min(24vw,280px);letter-spacing:.12em;
+      color:rgba(227,111,82,.18);-webkit-text-stroke:3px rgba(28,43,51,.22);transform:rotate(-24deg);
+      user-select:none;white-space:nowrap}
+    #aj-demo-badge{position:fixed;top:12px;left:12px;z-index:2147483647;pointer-events:none;
+      background:#E36F52;color:#fff;border:3px solid #1C2B33;box-shadow:3px 3px 0 #1C2B33;
+      font:700 14px 'Silkscreen',monospace;letter-spacing:2px;padding:4px 10px}`;
+  document.head.appendChild(css);
+  const mark = document.createElement("div");
+  mark.id = "aj-watermark";
+  mark.setAttribute("aria-hidden", "true");
+  mark.innerHTML = "<b>DEMO</b>";
+  const badge = document.createElement("div");
+  badge.id = "aj-demo-badge";
+  badge.textContent = "DEMO";
+  document.body.append(mark, badge);
+})();
+</script>
+"""
+
+
+# ---------------------------------------------------------------------------
 # 16. Show the right page
 # ---------------------------------------------------------------------------
 PAGES = {
@@ -5297,6 +5330,7 @@ PAGES = {
 }
 
 st.html(RUNNER_HTML, unsafe_allow_javascript=True)
+js_block(*split_script(WATERMARK_HTML))   # "DEMO" watermark on every page
 stop_voice_on_page_change()
 if st.query_params.get("view") == "todo":
     todo_page()
